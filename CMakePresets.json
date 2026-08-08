@@ -1,0 +1,96 @@
+{
+  "version": 10,
+  "cmakeMinimumRequired": {
+    "major": 4,
+    "minor": 2,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Visual Studio 18 2026",
+      "architecture": {
+        "value": "x64",
+        "strategy": "set"
+      },
+      "binaryDir": "${sourceDir}/build/preset-${presetName}",
+      "cacheVariables": {
+        "CMAKE_CXX_STANDARD": "20",
+        "CMAKE_TOOLCHAIN_FILE": "C:/Program Files (x86)/Microsoft Visual Studio/18/BuildTools/VC/vcpkg/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_INSTALLED_DIR": "C:/tmp/sat-data-reader-vcpkg-installed",
+        "VCPKG_TARGET_TRIPLET": "x64-windows"
+      }
+    },
+    {
+      "name": "dev",
+      "inherits": "base",
+      "displayName": "Development (CUDA sm_120 + viewer)",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "120",
+        "SATVIEW_ENABLE_CUDA": "ON",
+        "SATVIEW_BUILD_TESTS": "ON",
+        "SATVIEW_BUILD_VIEWER": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release (CUDA sm_120 + viewer)",
+      "cacheVariables": {
+        "CMAKE_CUDA_ARCHITECTURES": "120",
+        "SATVIEW_ENABLE_CUDA": "ON",
+        "SATVIEW_BUILD_TESTS": "ON",
+        "SATVIEW_BUILD_VIEWER": "ON"
+      }
+    },
+    {
+      "name": "cpu-dev",
+      "inherits": "base",
+      "displayName": "Development (CPU diagnostics only)",
+      "cacheVariables": {
+        "SATVIEW_ENABLE_CUDA": "OFF",
+        "SATVIEW_BUILD_TESTS": "ON",
+        "SATVIEW_BUILD_VIEWER": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "configuration": "RelWithDebInfo",
+      "jobs": 0
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "configuration": "Release",
+      "jobs": 0
+    },
+    {
+      "name": "cpu-dev",
+      "configurePreset": "cpu-dev",
+      "configuration": "RelWithDebInfo",
+      "jobs": 0
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "configuration": "RelWithDebInfo",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release",
+      "configurePreset": "release",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

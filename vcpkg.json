@@ -1,0 +1,39 @@
+{
+  "name": "sat-data-reader",
+  "version-string": "0.5.1",
+  "builtin-baseline": "cb2981c4e03d421fa03b9bb5044cd1986180e7e4",
+  "dependencies": [
+    {
+      "name": "hdf5",
+      "default-features": false,
+      "features": [
+        "zlib"
+      ]
+    },
+    "zlib",
+    "nlohmann-json",
+    {
+      "name": "sdl3",
+      "default-features": false,
+      "features": [
+        "vulkan"
+      ]
+    },
+    {
+      "name": "imgui",
+      "features": [
+        "docking-experimental",
+        "sdl3-binding",
+        "vulkan-binding"
+      ]
+    },
+    "vulkan",
+    {
+      "name": "glslang",
+      "host": true,
+      "features": [
+        "tools"
+      ]
+    }
+  ]
+}

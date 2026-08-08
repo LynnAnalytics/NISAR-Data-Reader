@@ -1,0 +1,27 @@
+# Local build products
+/build/
+/out/
+/vcpkg_installed/
+/.vs/
+/.venv/
+
+# User-local CMake settings
+/CMakeUserPresets.json
+
+# Large NISAR products are local test fixtures, never source artifacts.
+/Test Data/
+
+# Root-level compiler probes and scratch objects
+/*.obj
+
+# Generated caches and traces
+/.satview-cache/
+/*.nsys-rep
+/*.ncu-rep
+/*.trace
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.user
+*.suo
