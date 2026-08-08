@@ -1,6 +1,6 @@
 # NISAR Data Reader
 
-An exploratory visualizer for NISAR data releases. Reads raw HDF5 files in seconds rather than minutes with a custom rendering pipeline built in Vulkan & CUDA. 
+An open-source exploratory visualizer for (NASA-ISRO Synthetic Aperture Radar) NISAR data packages. Reads GSLC/GCOV HDF5 files in seconds rather than minutes with a custom rendering pipeline built in Vulkan & CUDA. 
 
 ![NISAR Data Reader displaying a GCOV product](docs/images/nisar-data-reader.png)
 
