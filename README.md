@@ -1,8 +1,6 @@
 # NISAR Data Reader
 
-A native, GPU-first desktop viewer for NISAR GSLC and GCOV HDF5 products.
-Native HDF5 reads feed CUDA scientific transforms and Vulkan presentation for
-responsive exploration of large SAR products.
+An exploratory visualizer for NISAR data releases. Reads raw HDF5 files in seconds rather than minutes with a custom rendering pipeline built in Vulkan & CUDA. 
 
 ![NISAR Data Reader displaying a GCOV product](docs/images/nisar-data-reader.png)
 
@@ -28,14 +26,13 @@ LOD pages live in bounded memory for the current session.
 ## Requirements
 
 - Windows 10 or 11.
-- NVIDIA RTX 5090-class GPU (`sm_120`).
+- At the moment, NVIDIA RTX 5080 or better (`sm_120`).
 - CUDA Toolkit 13.3.
 - Vulkan driver with timeline semaphore and Win32 external-memory support.
 - Visual Studio 18 2026 Build Tools with MSVC and C++ CMake tools.
 - CMake 4.2 or newer.
 
-The checked-in Release configuration targets the RTX 5090. Other CUDA/Vulkan
-adapters require an architecture change and validation.
+The release configuration targets the RTX 5090. 
 
 ## Build
 
@@ -95,10 +92,6 @@ Start with a centered 4x4 native source footprint:
 | `F11` | Toggle borderless fullscreen |
 | Fit Scene | Show the complete raster |
 
-**Smooth** provides validity-aware display interpolation. **Exact Pixels**
-selects the nearest stored sample. Low, High, Gamma, colormap, sampling, and
-camera changes update the Vulkan presentation directly. Scientific mode and
-speckle changes reuse the resident raw samples and rerun the CUDA pipeline.
 
 ## Command-line options
 
