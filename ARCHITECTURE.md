@@ -4,18 +4,33 @@ NISAR Data Reader is organized around a two-tier native-grid pipeline: exact
 bounded source-chunk mosaics for near views and guarded, on-demand screen-space
 LOD pages for far views. It never materializes a product-sized raster and never
 routes data through GDAL. HDF5 is the only raster/container reader; CUDA owns
-scientific transformation; Vulkan owns presentation.
+the production fast path, CPU is the automatic fallback, and Vulkan owns
+presentation. HIP/ROCm and oneAPI/SYCL are opt-in experimental compute paths.
 
 ## Components
 
 | Component | Responsibility |
 | --- | --- |
-| `satview_core` | Identify GSLC/GCOV products, catalog grids and datasets, construct chunk-aligned read plans, read into caller memory, and build bounded raw LOD pages with native HDF5. |
-| `satview_gpu` | Own the reusable pinned ring, scientific transforms, speckle filters, and asynchronous resident distributions. |
+| `satview_core` | Identify products, read bounded native-HDF5 pages, provide pageable staging, and run CPU scientific processing. |
+| `satview_gpu` | Own the CUDA pinned ring, transforms, speckle filters, and asynchronous distributions. |
+| `satview_hip_backend` / `satview_sycl_backend` | Run the experimental accelerator transforms and speckle filters. |
 | `vulkan_interop` | Export a Vulkan device-local buffer to CUDA and import a Vulkan timeline semaphore into CUDA. |
-| `sat-viewer` | Coordinate the exact reader, in-memory overview worker, continuous camera, CUDA stream, Vulkan renderer, SDL3 window, and Dear ImGui controls. |
+| `sat-viewer` | Coordinate the reader, in-memory overview worker, selected compute backend, Vulkan renderer, SDL3 window, and controls. |
 | `sat-inspect` | Emit a human or JSON catalog without loading full science rasters. |
 | `sat-bench` | Measure open/catalog, HDF5 read/decode, pinned H2D, and CUDA transform stages. |
+
+## Backend selection
+
+`--backend auto` selects CUDA when an `sm_120` device and the compiled CUDA
+path are available, then falls back to CPU. Explicit `cuda` reports an error
+instead of falling back. HIP and SYCL require both the master experimental
+CMake switch and their backend switch, and are selected explicitly.
+
+CUDA writes directly into Vulkan-exported memory. CPU, HIP, and SYCL use one
+reusable pageable read ring and one persistent host-visible Vulkan staging
+buffer. HIP/SYCL execute transforms, validity handling, and Boxcar/Lee filters
+on the accelerator; distribution summaries run after the bounded result is
+staged back to the host. The detailed path below describes the CUDA fast path.
 
 ## Product discovery and reads
 
@@ -108,7 +123,7 @@ image. The renderer then performs a coverage-aware 120 ms crossfade: pixels
 covered by both sources blend, while pixels covered by only one source retain
 that valid source. Camera-only changes inside the resident source are draw-only.
 
-## Exact native read path
+## CUDA exact native read path
 
 For a selected native mosaic:
 
@@ -294,7 +309,7 @@ resident distribution always scans the post-filter field.
 
 ## Rendering and display controls
 
-The CUDA result is a scalar R32F field. The fragment shader:
+The scientific result is a scalar R32F field. The fragment shader:
 
 - maps the axis-aligned draw rectangle through the inverse camera rotation into
   a resident native mosaic or LOD page, discarding fragments outside the
@@ -379,12 +394,12 @@ page.
 
 ## Shutdown and error behavior
 
-Interop support is validated at startup and failures are reported rather than
-silently selecting another backend. The native reader and overview worker are
-stopped and joined before their source product or pinned storage is destroyed.
-The CUDA stream is drained before persistent
-CUDA resources are released, and Vulkan is made idle before swapchain and
-interop objects are destroyed.
+Automatic selection falls back to CPU only when the CUDA path is unavailable;
+an explicitly requested accelerator reports its error. The native reader and
+overview worker are stopped and joined before their source product or staging
+storage is destroyed. The CUDA stream is drained before persistent CUDA
+resources are released, and Vulkan is made idle before swapchain and interop
+objects are destroyed.
 
 ## Runtime package layout
 

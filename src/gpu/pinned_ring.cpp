@@ -107,22 +107,29 @@ struct PinnedRing::Impl final {
         free_slots(options.slot_count),
         ready_slots(options.slot_count) {
     try {
-      void* allocation = nullptr;
-      const cudaError_t allocation_result = cudaHostAlloc(
-          &allocation, total_bytes, options.host_alloc_flags);
-      if (allocation_result != cudaSuccess) {
-        throw_cuda_error("cudaHostAlloc", allocation_result);
+      if (options.page_locked) {
+        void* allocation = nullptr;
+        const cudaError_t allocation_result = cudaHostAlloc(
+            &allocation, total_bytes, options.host_alloc_flags);
+        if (allocation_result != cudaSuccess) {
+          throw_cuda_error("cudaHostAlloc", allocation_result);
+        }
+        allocation_ = static_cast<std::byte*>(allocation);
+      } else {
+        pageable_allocation_ = std::make_unique<std::byte[]>(total_bytes);
+        allocation_ = pageable_allocation_.get();
       }
-      allocation_ = static_cast<std::byte*>(allocation);
 
       for (std::size_t index = 0; index < slots.size(); ++index) {
         Slot& slot = slots[index];
         slot.data = allocation_ + (index * options.bytes_per_slot);
 
-        const cudaError_t event_result = cudaEventCreateWithFlags(
-            &slot.completion, cudaEventDisableTiming);
-        if (event_result != cudaSuccess) {
-          throw_cuda_error("cudaEventCreateWithFlags", event_result);
+        if (options.page_locked) {
+          const cudaError_t event_result = cudaEventCreateWithFlags(
+              &slot.completion, cudaEventDisableTiming);
+          if (event_result != cudaSuccess) {
+            throw_cuda_error("cudaEventCreateWithFlags", event_result);
+          }
         }
         free_slots.push(index);
       }
@@ -215,6 +222,10 @@ struct PinnedRing::Impl final {
       throw std::logic_error{
           "PinnedRing: mark_in_flight requires an active Ready lease"};
     }
+    if (!options.page_locked) {
+      throw std::logic_error{
+          "PinnedRing: pageable slots must use mark_consumed"};
+    }
 
     const cudaError_t record_result =
         cudaEventRecord(slot.completion, stream);
@@ -229,6 +240,20 @@ struct PinnedRing::Impl final {
 
     slot.leased = false;
     slot.state = SlotState::InFlight;
+  }
+
+  void mark_consumed(const std::size_t index) {
+    std::lock_guard lock{mutex};
+    Slot& slot = slots[index];
+    if (slot.state != SlotState::Ready || !slot.leased) {
+      throw std::logic_error{
+          "PinnedRing: mark_consumed requires an active Ready lease"};
+    }
+    slot.payload_size = 0;
+    slot.leased = false;
+    slot.state = SlotState::Free;
+    free_slots.push(index);
+    changed.notify_all();
   }
 
   void release_lease(const std::size_t index, const LeaseRole role) noexcept {
@@ -272,10 +297,11 @@ struct PinnedRing::Impl final {
       slot.completion = nullptr;
     }
 
-    if (allocation_ != nullptr) {
+    if (allocation_ != nullptr && options.page_locked) {
       static_cast<void>(cudaFreeHost(allocation_));
-      allocation_ = nullptr;
     }
+    pageable_allocation_.reset();
+    allocation_ = nullptr;
   }
 
   const Options options;
@@ -288,6 +314,7 @@ struct PinnedRing::Impl final {
 
  private:
   std::byte* allocation_ = nullptr;
+  std::unique_ptr<std::byte[]> pageable_allocation_;
 };
 
 PinnedRing::SlotLease::SlotLease(std::shared_ptr<Impl> impl,
@@ -372,6 +399,18 @@ void PinnedRing::SlotLease::mark_in_flight(cudaStream_t stream) {
   }
 
   impl_->mark_in_flight(index_, stream);
+  impl_.reset();
+  index_ = kInvalidSlot;
+  role_ = LeaseRole::None;
+}
+
+void PinnedRing::SlotLease::mark_consumed() {
+  if (impl_ == nullptr || role_ != LeaseRole::Ready) {
+    throw std::logic_error{
+        "PinnedRing::SlotLease::mark_consumed requires a Ready lease"};
+  }
+
+  impl_->mark_consumed(index_);
   impl_.reset();
   index_ = kInvalidSlot;
   role_ = LeaseRole::None;
@@ -508,7 +547,9 @@ std::size_t PinnedRing::bytes_per_slot() const noexcept {
 }
 
 std::size_t PinnedRing::total_pinned_bytes() const noexcept {
-  return impl_ == nullptr ? 0 : impl_->total_bytes;
+  return impl_ == nullptr || !impl_->options.page_locked
+      ? 0
+      : impl_->total_bytes;
 }
 
 PinnedRing::StateCounts PinnedRing::state_counts() const {

@@ -12,12 +12,13 @@
 #include <string_view>
 #include <vector>
 
-#ifdef SATVIEW_HAS_CUDA
 int run_distribution_tests();
+#ifdef SATVIEW_HAS_CUDA
 int run_gpu_distribution_tests();
 int run_gpu_transform_tests();
 #endif
 int run_colormap_tests();
+int run_cpu_scientific_tests();
 int run_overview_tests(const satview::Hdf5Product& product);
 int run_overview_spacing_tests(const satview::Hdf5Product& product);
 int run_real_mosaic_plan_tests(const satview::Hdf5Product& product);
@@ -382,6 +383,8 @@ void test_gslc(TestContext &test, const std::filesystem::path &file,
 int main() {
   TestContext test;
   test.failures += run_colormap_tests();
+  test.failures += run_cpu_scientific_tests();
+  test.failures += run_distribution_tests();
   test.failures += run_resident_view_tests();
   test.failures += run_viewer_math_tests();
   try {
@@ -403,7 +406,6 @@ int main() {
   }
 
 #ifdef SATVIEW_HAS_CUDA
-  test.failures += run_distribution_tests();
   test.failures += run_gpu_distribution_tests();
   test.failures += run_gpu_transform_tests();
 #endif

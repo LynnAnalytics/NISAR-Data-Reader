@@ -1,4 +1,4 @@
-#include "satview/gpu/distribution.hpp"
+#include "satview/distribution.hpp"
 
 #include <cmath>
 #include <cstdint>

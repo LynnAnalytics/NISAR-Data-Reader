@@ -1,7 +1,3 @@
-if(NOT TARGET satview::gpu)
-  message(FATAL_ERROR "The native viewer requires SATVIEW_ENABLE_CUDA=ON")
-endif()
-
 find_package(SDL3 CONFIG REQUIRED)
 find_package(Vulkan REQUIRED)
 find_package(imgui CONFIG REQUIRED)
@@ -64,7 +60,6 @@ add_executable(
   colormap_lut.cpp
   colormaps.cpp
   overview_worker.cpp
-  "${CMAKE_SOURCE_DIR}/src/gpu/vulkan_interop.cpp"
   "${SATVIEW_VERTEX_SPIRV}"
   "${SATVIEW_FRAGMENT_SPIRV}"
 )
@@ -87,12 +82,24 @@ target_link_libraries(
   sat-viewer
   PRIVATE
     satview::core
-    satview::gpu
     SDL3::SDL3
     Vulkan::Vulkan
     imgui::imgui
     Comdlg32
 )
+if(TARGET satview::gpu)
+  target_sources(
+    sat-viewer PRIVATE "${CMAKE_SOURCE_DIR}/src/gpu/vulkan_interop.cpp"
+  )
+  target_link_libraries(sat-viewer PRIVATE satview::gpu)
+  target_compile_definitions(sat-viewer PRIVATE SATVIEW_HAS_CUDA=1)
+endif()
+if(TARGET satview::hip_backend)
+  target_link_libraries(sat-viewer PRIVATE satview::hip_backend)
+endif()
+if(TARGET satview::sycl_backend)
+  target_link_libraries(sat-viewer PRIVATE satview::sycl_backend)
+endif()
 target_compile_features(sat-viewer PRIVATE cxx_std_20)
 target_compile_definitions(
   sat-viewer

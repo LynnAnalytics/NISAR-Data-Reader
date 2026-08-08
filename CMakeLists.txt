@@ -2,14 +2,40 @@ cmake_minimum_required(VERSION 4.2)
 
 project(
   NISARDataReader
-  VERSION 0.5.4
-  DESCRIPTION "GPU-first native NISAR GSLC/GCOV viewer"
+  VERSION 0.6.0
+  DESCRIPTION "CUDA-first native NISAR GSLC/GCOV viewer with CPU fallback"
   LANGUAGES CXX
 )
 
 option(SATVIEW_ENABLE_CUDA "Build CUDA scientific transforms" ON)
+option(
+  SATVIEW_EXPERIMENTAL_BACKENDS
+  "Allow explicitly selected experimental compute backends"
+  OFF
+)
+option(
+  SATVIEW_ENABLE_EXPERIMENTAL_HIP
+  "Build the experimental AMD HIP/ROCm compute backend"
+  OFF
+)
+option(
+  SATVIEW_ENABLE_EXPERIMENTAL_SYCL
+  "Build the experimental Intel oneAPI/SYCL compute backend"
+  OFF
+)
 option(SATVIEW_BUILD_TESTS "Build unit and integration tests" ON)
 option(SATVIEW_BUILD_VIEWER "Build the Vulkan desktop viewer" ON)
+
+if(
+  (SATVIEW_ENABLE_EXPERIMENTAL_HIP OR
+   SATVIEW_ENABLE_EXPERIMENTAL_SYCL) AND
+  NOT SATVIEW_EXPERIMENTAL_BACKENDS
+)
+  message(FATAL_ERROR
+    "Experimental HIP/SYCL backends require "
+    "SATVIEW_EXPERIMENTAL_BACKENDS=ON"
+  )
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,7 +58,30 @@ find_package(hdf5 CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(ZLIB REQUIRED)
 
+set(SATVIEW_CUDA_AVAILABLE OFF)
+if(SATVIEW_ENABLE_CUDA)
+  include(CheckLanguage)
+  check_language(CUDA)
+  if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    find_package(CUDAToolkit 13.3 QUIET)
+    if(CUDAToolkit_FOUND)
+      set(SATVIEW_CUDA_AVAILABLE ON)
+    else()
+      message(WARNING
+        "CUDA Toolkit 13.3 was not found; building the CPU fallback"
+      )
+    endif()
+  else()
+    message(STATUS
+      "No CUDA compiler was found; building the CPU fallback"
+    )
+  endif()
+endif()
+
 add_library(satview_core
+  src/cpu/pageable_ring.cpp
+  src/cpu/scientific.cpp
   src/hdf5_product.cpp
   src/overview_builder.cpp
   src/view_navigation.cpp
@@ -53,10 +102,7 @@ target_link_libraries(
 )
 target_compile_features(satview_core PUBLIC cxx_std_20)
 
-if(SATVIEW_ENABLE_CUDA)
-  enable_language(CUDA)
-  find_package(CUDAToolkit 13.3 REQUIRED)
-
+if(SATVIEW_CUDA_AVAILABLE)
   add_library(satview_gpu
     src/gpu/distribution.cu
     src/gpu/transforms.cu
@@ -84,6 +130,8 @@ if(SATVIEW_ENABLE_CUDA)
       CUDA_STANDARD_REQUIRED ON
       POSITION_INDEPENDENT_CODE ON
   )
+else()
+  target_sources(satview_core PRIVATE src/distribution.cpp)
 endif()
 
 add_executable(sat-inspect apps/inspect_main.cpp)
@@ -91,7 +139,7 @@ target_link_libraries(sat-inspect PRIVATE satview::core nlohmann_json::nlohmann_
 
 add_executable(sat-bench apps/bench_main.cpp)
 target_link_libraries(sat-bench PRIVATE satview::core)
-if(SATVIEW_ENABLE_CUDA)
+if(SATVIEW_CUDA_AVAILABLE)
   target_link_libraries(sat-bench PRIVATE satview::gpu)
   target_compile_definitions(sat-bench PRIVATE SATVIEW_HAS_CUDA=1)
 endif()
@@ -120,6 +168,55 @@ if(MSVC)
   include(InstallRequiredSystemLibraries)
 endif()
 
+if(SATVIEW_EXPERIMENTAL_BACKENDS AND SATVIEW_ENABLE_EXPERIMENTAL_HIP)
+  check_language(HIP)
+  if(NOT CMAKE_HIP_COMPILER)
+    message(FATAL_ERROR
+      "The experimental HIP backend requires a ROCm HIP compiler. "
+      "Set CMAKE_HIP_COMPILER to amdclang++ from the ROCm SDK."
+    )
+  endif()
+  enable_language(HIP)
+  find_package(hip CONFIG REQUIRED)
+  add_library(satview_hip_backend src/experimental/hip/scientific.hip)
+  add_library(satview::hip_backend ALIAS satview_hip_backend)
+  target_include_directories(satview_hip_backend PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+  )
+  target_link_libraries(satview_hip_backend PUBLIC hip::host)
+  target_compile_definitions(
+    satview_hip_backend PUBLIC SATVIEW_HAS_EXPERIMENTAL_HIP=1
+  )
+  set_target_properties(satview_hip_backend PROPERTIES
+    HIP_STANDARD 20
+    HIP_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON
+  )
+endif()
+
+if(SATVIEW_EXPERIMENTAL_BACKENDS AND SATVIEW_ENABLE_EXPERIMENTAL_SYCL)
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
+    message(FATAL_ERROR
+      "The experimental oneAPI/SYCL backend requires the IntelLLVM "
+      "compiler. Configure with icx plus Ninja on Windows."
+    )
+  endif()
+  find_package(IntelSYCL REQUIRED)
+  add_library(satview_sycl_backend src/experimental/sycl/scientific.cpp)
+  add_library(satview::sycl_backend ALIAS satview_sycl_backend)
+  target_include_directories(satview_sycl_backend PUBLIC
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+  )
+  target_compile_definitions(
+    satview_sycl_backend PUBLIC SATVIEW_HAS_EXPERIMENTAL_SYCL=1
+  )
+  target_compile_features(satview_sycl_backend PUBLIC cxx_std_20)
+  add_sycl_to_target(
+    TARGET satview_sycl_backend
+    SOURCES src/experimental/sycl/scientific.cpp
+  )
+endif()
+
 if(SATVIEW_BUILD_VIEWER)
   add_subdirectory(viewer)
 endif()
@@ -128,6 +225,8 @@ if(SATVIEW_BUILD_TESTS)
   include(CTest)
   add_executable(satview-tests
     tests/colormap_tests.cpp
+    tests/cpu_scientific_tests.cpp
+    tests/distribution_tests.cpp
     tests/overview_builder_tests.cpp
     tests/real_mosaic_plan_tests.cpp
     tests/resident_view_tests.cpp
@@ -139,10 +238,9 @@ if(SATVIEW_BUILD_TESTS)
     "${CMAKE_CURRENT_SOURCE_DIR}/viewer"
   )
   target_link_libraries(satview-tests PRIVATE satview::core)
-  if(SATVIEW_ENABLE_CUDA)
+  if(SATVIEW_CUDA_AVAILABLE)
     target_link_libraries(satview-tests PRIVATE satview::gpu)
     target_sources(satview-tests PRIVATE
-      tests/distribution_tests.cpp
       tests/gpu_distribution_tests.cu
       tests/gpu_transform_tests.cu
     )
@@ -183,5 +281,28 @@ if(SATVIEW_BUILD_TESTS)
   )
   target_link_libraries(satview-navigation-tests PRIVATE satview::core)
   add_test(NAME satview-navigation-tests COMMAND satview-navigation-tests)
-endif()
 
+  if(TARGET satview::hip_backend OR TARGET satview::sycl_backend)
+    add_executable(
+      satview-experimental-backend-tests
+      tests/experimental_backend_tests.cpp
+    )
+    target_link_libraries(
+      satview-experimental-backend-tests PRIVATE satview::core
+    )
+    if(TARGET satview::hip_backend)
+      target_link_libraries(
+        satview-experimental-backend-tests PRIVATE satview::hip_backend
+      )
+    endif()
+    if(TARGET satview::sycl_backend)
+      target_link_libraries(
+        satview-experimental-backend-tests PRIVATE satview::sycl_backend
+      )
+    endif()
+    add_test(
+      NAME satview-experimental-backend-tests
+      COMMAND satview-experimental-backend-tests
+    )
+  endif()
+endif()

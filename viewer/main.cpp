@@ -7,11 +7,17 @@
 #include "colormaps.hpp"
 #include "overview_worker.hpp"
 
+#include "satview/cpu/pageable_ring.hpp"
+#include "satview/cpu/scientific.hpp"
+#include "satview/distribution.hpp"
+#include "satview/experimental/scientific.hpp"
+#if defined(SATVIEW_HAS_CUDA)
 #include "satview/gpu/distribution.hpp"
 #include "satview/gpu/pinned_ring.hpp"
 #include "satview/gpu/speckle_filter.hpp"
 #include "satview/gpu/transforms.hpp"
 #include "satview/gpu/vulkan_interop.hpp"
+#endif
 #include "satview/hdf5_product.hpp"
 #include "satview/resident_view.hpp"
 #include "satview/view_navigation.hpp"
@@ -25,7 +31,9 @@
 #include <imgui_impl_vulkan.h>
 #include <vulkan/vulkan.h>
 
+#if defined(SATVIEW_HAS_CUDA)
 #include <cuda_runtime_api.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -58,6 +66,13 @@
 namespace {
 
 using Clock = std::chrono::steady_clock;
+#if defined(SATVIEW_HAS_CUDA)
+using ReadRing = satview::gpu::PinnedRing;
+#else
+using ReadRing = satview::cpu::PageableRing;
+#endif
+using ReadSlotLease = ReadRing::SlotLease;
+using ReadRingState = ReadRing::StateCounts;
 
 constexpr std::uint32_t kContiguousTileExtent = 2048;
 constexpr std::size_t kPinnedSlotCount = 3;
@@ -79,6 +94,7 @@ void check_vk(const VkResult result, std::string_view operation) {
     }
 }
 
+#if defined(SATVIEW_HAS_CUDA)
 void check_cuda(const cudaError_t result, std::string_view operation) {
     if (result != cudaSuccess) {
         std::ostringstream message;
@@ -86,19 +102,51 @@ void check_cuda(const cudaError_t result, std::string_view operation) {
         throw std::runtime_error(message.str());
     }
 }
+#endif
+
+enum class BackendPreference : std::uint8_t {
+    automatic,
+    cuda,
+    cpu,
+    hip,
+    sycl,
+};
+
+enum class ComputeBackend : std::uint8_t {
+    cuda,
+    cpu,
+    hip,
+    sycl,
+};
+
+[[nodiscard]] constexpr std::string_view backend_name(
+    const ComputeBackend backend) noexcept {
+    switch (backend) {
+        case ComputeBackend::cuda:
+            return "CUDA";
+        case ComputeBackend::cpu:
+            return "CPU";
+        case ComputeBackend::hip:
+            return "HIP/ROCm experimental";
+        case ComputeBackend::sycl:
+            return "oneAPI/SYCL experimental";
+    }
+    return "unknown";
+}
 
 struct Arguments {
     std::filesystem::path file;
     std::optional<std::uint64_t> frame_limit;
     std::uint32_t zoom_chunks = 1;
-    satview::gpu::SpeckleFilter speckle_filter =
-        satview::gpu::SpeckleFilter::none;
+    satview::cpu::SpeckleFilter speckle_filter =
+        satview::cpu::SpeckleFilter::none;
     std::uint32_t speckle_window = 5;
     float speckle_looks = 1.0F;
     double rotation_degrees = 0.0;
     bool clean_view = false;
     bool smoke_test = false;
     bool fit_scene = false;
+    BackendPreference backend = BackendPreference::automatic;
 };
 
 [[noreturn]] void usage_error(std::string_view message) {
@@ -108,6 +156,7 @@ struct Arguments {
               "[--speckle none|boxcar|lee] [--speckle-window 3|5|7] "
               "[--speckle-looks N] "
               "[--rotation DEGREES] "
+              "[--backend auto|cuda|cpu|hip|sycl] "
               "[--clean-view] "
               "[--fit-scene] [--frames N | --smoke-test] "
               "[NISAR-product.h5]";
@@ -124,6 +173,7 @@ Arguments parse_arguments(const int argc, char** argv) {
                    "[--speckle none|boxcar|lee] [--speckle-window 3|5|7] "
                    "[--speckle-looks N] "
                    "[--rotation DEGREES] "
+                   "[--backend auto|cuda|cpu|hip|sycl] "
                    "[--clean-view] "
                    "[--fit-scene] [--frames N | --smoke-test] "
                    "[NISAR-product.h5]\n"
@@ -133,6 +183,7 @@ Arguments parse_arguments(const int argc, char** argv) {
                    "  --speckle-window N  initial 3x3, 5x5, or 7x7 window\n"
                    "  --speckle-looks N   initial Lee equivalent looks (> 0)\n"
                    "  --rotation N  initial clockwise rotation in degrees\n"
+                   "  --backend B   compute backend; auto prefers CUDA\n"
                    "  --clean-view  start with the left controls hidden\n"
                    "  --fit-scene   start with the entire raster visible\n"
                    "  --frames N    exit after N presented frames\n"
@@ -174,11 +225,11 @@ Arguments parse_arguments(const int argc, char** argv) {
             }
             const std::string_view name(argv[index]);
             if (name == "none") {
-                result.speckle_filter = satview::gpu::SpeckleFilter::none;
+                result.speckle_filter = satview::cpu::SpeckleFilter::none;
             } else if (name == "boxcar") {
-                result.speckle_filter = satview::gpu::SpeckleFilter::boxcar;
+                result.speckle_filter = satview::cpu::SpeckleFilter::boxcar;
             } else if (name == "lee") {
-                result.speckle_filter = satview::gpu::SpeckleFilter::lee;
+                result.speckle_filter = satview::cpu::SpeckleFilter::lee;
             } else {
                 usage_error("--speckle requires none, boxcar, or lee");
             }
@@ -232,6 +283,26 @@ Arguments parse_arguments(const int argc, char** argv) {
             result.rotation_degrees = parsed;
             continue;
         }
+        if (argument == "--backend") {
+            if (++index >= argc) {
+                usage_error("--backend requires auto, cuda, cpu, hip, or sycl");
+            }
+            const std::string_view name(argv[index]);
+            if (name == "auto") {
+                result.backend = BackendPreference::automatic;
+            } else if (name == "cuda") {
+                result.backend = BackendPreference::cuda;
+            } else if (name == "cpu") {
+                result.backend = BackendPreference::cpu;
+            } else if (name == "hip" || name == "rocm") {
+                result.backend = BackendPreference::hip;
+            } else if (name == "sycl" || name == "oneapi") {
+                result.backend = BackendPreference::sycl;
+            } else {
+                usage_error("--backend requires auto, cuda, cpu, hip, or sycl");
+            }
+            continue;
+        }
         if (argument == "--frames") {
             if (++index >= argc) {
                 usage_error("--frames requires a positive integer");
@@ -264,6 +335,79 @@ Arguments parse_arguments(const int argc, char** argv) {
     return result;
 }
 
+[[nodiscard]] bool cuda_runtime_available(std::string& reason) noexcept {
+#if defined(SATVIEW_HAS_CUDA)
+    int device_count = 0;
+    const cudaError_t result = cudaGetDeviceCount(&device_count);
+    if (result != cudaSuccess) {
+        const char* const description = cudaGetErrorString(result);
+        reason = description != nullptr
+            ? description
+            : "CUDA runtime initialization failed";
+        static_cast<void>(cudaGetLastError());
+        return false;
+    }
+    for (int device = 0; device < device_count; ++device) {
+        cudaDeviceProp properties{};
+        if (cudaGetDeviceProperties(&properties, device) == cudaSuccess &&
+            properties.major == 12 && cudaSetDevice(device) == cudaSuccess) {
+            reason.clear();
+            return true;
+        }
+    }
+    static_cast<void>(cudaGetLastError());
+    reason = device_count == 0
+        ? "no CUDA device was found"
+        : "no sm_120-compatible CUDA device was found";
+    return false;
+#else
+    reason = "CUDA support was not compiled";
+    return false;
+#endif
+}
+
+[[nodiscard]] ComputeBackend select_backend(
+    const BackendPreference preference) {
+    std::string reason;
+    switch (preference) {
+        case BackendPreference::automatic:
+            return cuda_runtime_available(reason)
+                ? ComputeBackend::cuda
+                : ComputeBackend::cpu;
+        case BackendPreference::cuda:
+            if (!cuda_runtime_available(reason)) {
+                throw std::runtime_error(
+                    "CUDA backend is unavailable: " + reason);
+            }
+            return ComputeBackend::cuda;
+        case BackendPreference::cpu:
+            return ComputeBackend::cpu;
+        case BackendPreference::hip:
+#if defined(SATVIEW_HAS_EXPERIMENTAL_HIP)
+            if (!satview::experimental::hip_runtime_available(reason)) {
+                throw std::runtime_error(
+                    "experimental HIP/ROCm backend is unavailable: " + reason);
+            }
+            return ComputeBackend::hip;
+#else
+            fail(
+                "HIP/ROCm support was not compiled; enable the experimental HIP build flag");
+#endif
+        case BackendPreference::sycl:
+#if defined(SATVIEW_HAS_EXPERIMENTAL_SYCL)
+            if (!satview::experimental::sycl_runtime_available(reason)) {
+                throw std::runtime_error(
+                    "experimental oneAPI/SYCL backend is unavailable: " + reason);
+            }
+            return ComputeBackend::sycl;
+#else
+            fail(
+                "oneAPI/SYCL support was not compiled; enable the experimental SYCL build flag");
+#endif
+    }
+    fail("invalid compute backend selection");
+}
+
 enum class DisplayMode : std::uint8_t {
     amplitude,
     power,
@@ -276,8 +420,8 @@ enum class DisplayMode : std::uint8_t {
 };
 
 struct SpeckleSettings {
-    satview::gpu::SpeckleFilter filter =
-        satview::gpu::SpeckleFilter::none;
+    satview::cpu::SpeckleFilter filter =
+        satview::cpu::SpeckleFilter::none;
     std::uint32_t window_size = 5;
     float equivalent_number_of_looks = 1.0F;
 
@@ -320,18 +464,18 @@ std::span<const ModeChoice> modes_for(const satview::DatasetInfo& layer) {
     return kGcovRealModes;
 }
 
-[[nodiscard]] std::optional<satview::gpu::SpeckleDomain>
+[[nodiscard]] std::optional<satview::cpu::SpeckleDomain>
 speckle_domain_for(
     const satview::DatasetInfo& layer,
     const DisplayMode mode) noexcept {
     if (layer.layer_kind == satview::LayerKind::gslc_polarization) {
         switch (mode) {
             case DisplayMode::amplitude:
-                return satview::gpu::SpeckleDomain::amplitude;
+                return satview::cpu::SpeckleDomain::amplitude;
             case DisplayMode::power:
-                return satview::gpu::SpeckleDomain::linear_power;
+                return satview::cpu::SpeckleDomain::linear_power;
             case DisplayMode::power_db:
-                return satview::gpu::SpeckleDomain::power_db;
+                return satview::cpu::SpeckleDomain::power_db;
             default:
                 return std::nullopt;
         }
@@ -339,10 +483,10 @@ speckle_domain_for(
     if (layer.layer_kind ==
         satview::LayerKind::gcov_diagonal_covariance) {
         if (mode == DisplayMode::linear) {
-            return satview::gpu::SpeckleDomain::linear_power;
+            return satview::cpu::SpeckleDomain::linear_power;
         }
         if (mode == DisplayMode::power_db) {
-            return satview::gpu::SpeckleDomain::power_db;
+            return satview::cpu::SpeckleDomain::power_db;
         }
     }
     return std::nullopt;
@@ -352,12 +496,12 @@ speckle_domain_for(
     const satview::DatasetInfo& layer,
     const DisplayMode mode,
     const SpeckleSettings settings) noexcept {
-    if (settings.filter == satview::gpu::SpeckleFilter::none ||
+    if (settings.filter == satview::cpu::SpeckleFilter::none ||
         !speckle_domain_for(layer, mode).has_value()) {
         return {};
     }
     SpeckleSettings result = settings;
-    if (result.filter == satview::gpu::SpeckleFilter::boxcar) {
+    if (result.filter == satview::cpu::SpeckleFilter::boxcar) {
         result.equivalent_number_of_looks = 1.0F;
     }
     return result;
@@ -392,7 +536,7 @@ bool is_renderable(const satview::DatasetInfo& layer) {
         layer.data_type.element_size == sizeof(float);
     const bool complex64 =
         layer.data_type.kind == satview::ScalarKind::compound_complex &&
-        layer.data_type.element_size == sizeof(float2);
+        layer.data_type.element_size == sizeof(satview::cpu::Complex32);
     if (layer.layer_kind == satview::LayerKind::gslc_polarization) {
         return complex64;
     }
@@ -671,14 +815,29 @@ struct ReadCompletion {
     std::string error;
 };
 
+[[nodiscard]] ReadRing make_read_ring(
+    const std::size_t bytes_per_slot, const bool page_locked) {
+#if defined(SATVIEW_HAS_CUDA)
+    return ReadRing(ReadRing::Options{
+        .slot_count = kPinnedSlotCount,
+        .bytes_per_slot = bytes_per_slot,
+        .page_locked = page_locked,
+    });
+#else
+    static_cast<void>(page_locked);
+    return ReadRing(kPinnedSlotCount, bytes_per_slot);
+#endif
+}
+
 class TileReader final {
 public:
     TileReader(
         const satview::Hdf5Product& product,
-        const ProductView& view)
+        const ProductView& view,
+        const bool page_locked)
         : product_(product),
           view_(view),
-          ring_(kPinnedSlotCount, view.maximum_input_bytes),
+          ring_(make_read_ring(view.maximum_input_bytes, page_locked)),
           thread_([this](std::stop_token stop) { reader_loop(stop); }) {}
 
     ~TileReader() {
@@ -711,7 +870,7 @@ public:
         return result;
     }
 
-    satview::gpu::PinnedRing::SlotLease try_take_ready_slot() {
+    ReadSlotLease try_take_ready_slot() {
         return ring_.try_acquire_ready();
     }
 
@@ -719,7 +878,7 @@ public:
         return ring_.reclaim_completed();
     }
 
-    satview::gpu::PinnedRing::StateCounts ring_state() const {
+    ReadRingState ring_state() const {
         return ring_.state_counts();
     }
 
@@ -896,7 +1055,7 @@ private:
 
     const satview::Hdf5Product& product_;
     const ProductView& view_;
-    satview::gpu::PinnedRing ring_;
+    ReadRing ring_;
     mutable std::mutex mutex_;
     std::condition_variable_any request_cv_;
     std::atomic<std::uint64_t> latest_serial_{0};
@@ -1050,6 +1209,7 @@ struct TileUpload {
     std::uint64_t vulkan_consumed_value = 0;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
+    std::span<const float> host_values;
 };
 
 struct DistributionCompletion {
@@ -1071,14 +1231,16 @@ public:
     VulkanRenderer(
         SDL_Window* window,
         const std::uint32_t maximum_width,
-        const std::uint32_t maximum_height)
+        const std::uint32_t maximum_height,
+        const bool cuda_interop)
         : window_(window),
           maximum_width_(maximum_width),
-          maximum_height_(maximum_height) {
+          maximum_height_(maximum_height),
+          cuda_interop_(cuda_interop) {
         try {
             create_instance();
             create_surface();
-            select_cuda_physical_device();
+            select_physical_device();
             create_device();
             create_descriptor_pool();
             create_swapchain();
@@ -1134,13 +1296,20 @@ public:
         }
     }
 
+#if defined(SATVIEW_HAS_CUDA)
     [[nodiscard]] void* cuda_output() const noexcept {
-        return exported_buffer_->cuda_ptr();
+        return exported_buffer_.has_value()
+            ? exported_buffer_->cuda_ptr()
+            : nullptr;
     }
 
     [[nodiscard]] satview::gpu::InteropTimeline& timeline() noexcept {
+        if (!timeline_.has_value()) {
+            fail("CUDA/Vulkan timeline requested by a host-staged backend");
+        }
         return *timeline_;
     }
+#endif
 
     [[nodiscard]] std::uint32_t maximum_width() const noexcept {
         return maximum_width_;
@@ -1199,6 +1368,17 @@ public:
         if (draw_data->DisplaySize.x <= 0.0F ||
             draw_data->DisplaySize.y <= 0.0F) {
             return result;
+        }
+
+        const bool interop_upload = upload.has_value() &&
+            upload->cuda_ready_value != 0;
+        if (upload.has_value()) {
+            if (interop_upload != cuda_interop_) {
+                fail("compute upload does not match the Vulkan backend mode");
+            }
+            if (!interop_upload) {
+                prepare_host_upload(*upload);
+            }
         }
 
         const auto acquired =
@@ -1283,13 +1463,17 @@ public:
         std::array<std::uint64_t, 2> signal_values{0, 0};
         std::uint32_t wait_count = 1;
         std::uint32_t signal_count = 1;
-        if (upload.has_value()) {
+        if (interop_upload) {
+#if defined(SATVIEW_HAS_CUDA)
             waits[1] = timeline_->vk_semaphore();
             wait_values[1] = upload->cuda_ready_value;
             signals[1] = timeline_->vk_semaphore();
             signal_values[1] = upload->vulkan_consumed_value;
             wait_count = 2;
             signal_count = 2;
+#else
+            fail("CUDA interop upload reached a CUDA-free viewer build");
+#endif
         }
 
         VkTimelineSemaphoreSubmitInfo timeline_submit{};
@@ -1302,7 +1486,7 @@ public:
 
         VkSubmitInfo submit{};
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submit.pNext = upload.has_value() ? &timeline_submit : nullptr;
+        submit.pNext = interop_upload ? &timeline_submit : nullptr;
         submit.waitSemaphoreCount = wait_count;
         submit.pWaitSemaphores = waits.data();
         submit.pWaitDstStageMask = wait_stages.data();
@@ -1351,9 +1535,9 @@ private:
         VkApplicationInfo application{};
         application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         application.pApplicationName = "NISAR Data Reader";
-        application.applicationVersion = VK_MAKE_VERSION(0, 4, 0);
+        application.applicationVersion = VK_MAKE_VERSION(0, 6, 0);
         application.pEngineName = "satview";
-        application.engineVersion = VK_MAKE_VERSION(0, 4, 0);
+        application.engineVersion = VK_MAKE_VERSION(0, 6, 0);
         application.apiVersion = VK_API_VERSION_1_3;
 
         VkInstanceCreateInfo create{};
@@ -1375,20 +1559,7 @@ private:
         }
     }
 
-    void select_cuda_physical_device() {
-        int cuda_device = 0;
-        check_cuda(cudaGetDevice(&cuda_device), "query current CUDA device");
-        cudaDeviceProp cuda_properties{};
-        check_cuda(
-            cudaGetDeviceProperties(&cuda_properties, cuda_device),
-            "query CUDA device properties");
-        static_assert(sizeof(cuda_properties.luid) == VK_LUID_SIZE);
-        std::array<char, VK_LUID_SIZE> cuda_luid{};
-        std::memcpy(
-            cuda_luid.data(), cuda_properties.luid, VK_LUID_SIZE);
-        const unsigned int cuda_node_mask =
-            cuda_properties.luidDeviceNodeMask;
-
+    void select_physical_device() {
         std::uint32_t device_count = 0;
         check_vk(
             vkEnumeratePhysicalDevices(instance_, &device_count, nullptr),
@@ -1402,23 +1573,49 @@ private:
                 instance_, &device_count, devices.data()),
             "enumerate Vulkan physical devices");
 
+#if defined(SATVIEW_HAS_CUDA)
+        std::array<char, VK_LUID_SIZE> cuda_luid{};
+        unsigned int cuda_node_mask = 0;
+        if (cuda_interop_) {
+            int cuda_device = 0;
+            check_cuda(cudaGetDevice(&cuda_device), "query current CUDA device");
+            cudaDeviceProp cuda_properties{};
+            check_cuda(
+                cudaGetDeviceProperties(&cuda_properties, cuda_device),
+                "query CUDA device properties");
+            static_assert(sizeof(cuda_properties.luid) == VK_LUID_SIZE);
+            std::memcpy(
+                cuda_luid.data(), cuda_properties.luid, VK_LUID_SIZE);
+            cuda_node_mask = cuda_properties.luidDeviceNodeMask;
+        }
+#else
+        if (cuda_interop_) {
+            fail("CUDA interop requested by a CUDA-free viewer build");
+        }
+#endif
+
+        int best_score = std::numeric_limits<int>::min();
         for (const auto candidate : devices) {
-            VkPhysicalDeviceIDProperties identity{};
-            identity.sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
-            VkPhysicalDeviceProperties2 properties{};
-            properties.sType =
-                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-            properties.pNext = &identity;
-            vkGetPhysicalDeviceProperties2(candidate, &properties);
-            if (!identity.deviceLUIDValid ||
-                std::memcmp(
-                    identity.deviceLUID,
-                    cuda_luid.data(),
-                    VK_LUID_SIZE) != 0 ||
-                identity.deviceNodeMask != cuda_node_mask) {
-                continue;
+#if defined(SATVIEW_HAS_CUDA)
+            if (cuda_interop_) {
+                VkPhysicalDeviceIDProperties identity{};
+                identity.sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+                VkPhysicalDeviceProperties2 properties{};
+                properties.sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+                properties.pNext = &identity;
+                vkGetPhysicalDeviceProperties2(candidate, &properties);
+                if (!identity.deviceLUIDValid ||
+                    std::memcmp(
+                        identity.deviceLUID,
+                        cuda_luid.data(),
+                        VK_LUID_SIZE) != 0 ||
+                    identity.deviceNodeMask != cuda_node_mask) {
+                    continue;
+                }
             }
+#endif
 
             std::uint32_t family_count = 0;
             vkGetPhysicalDeviceQueueFamilyProperties(
@@ -1435,25 +1632,47 @@ private:
                 if ((families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) !=
                         0 &&
                     presentation == VK_TRUE) {
-                    physical_device_ = candidate;
-                    queue_family_ = family;
-                    return;
+                    if (cuda_interop_) {
+                        physical_device_ = candidate;
+                        queue_family_ = family;
+                        return;
+                    }
+                    VkPhysicalDeviceProperties properties{};
+                    vkGetPhysicalDeviceProperties(candidate, &properties);
+                    int score = 0;
+                    if (properties.deviceType ==
+                        VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+                        score = 200;
+                    } else if (properties.deviceType ==
+                               VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+                        score = 100;
+                    }
+                    if (score > best_score) {
+                        best_score = score;
+                        physical_device_ = candidate;
+                        queue_family_ = family;
+                    }
+                    break;
                 }
             }
         }
-        fail(
-            "no Vulkan graphics/present device matches the current CUDA "
-            "device LUID");
+        if (physical_device_ == VK_NULL_HANDLE) {
+            fail(cuda_interop_
+                ? "no Vulkan graphics/present device matches the current CUDA device LUID"
+                : "no Vulkan graphics/present device is available");
+        }
     }
 
     void create_device() {
-        constexpr std::array extensions{
-            VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-            VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
-            VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
-            VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
-            VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
-        };
+        std::vector<const char*> extensions{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+        if (cuda_interop_) {
+            extensions.insert(
+                extensions.end(),
+                {VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+                 VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+                 VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
+                 VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME});
+        }
         const float priority = 1.0F;
         VkDeviceQueueCreateInfo queue{};
         queue.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -1468,7 +1687,7 @@ private:
 
         VkDeviceCreateInfo create{};
         create.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        create.pNext = &timeline_feature;
+        create.pNext = cuda_interop_ ? &timeline_feature : nullptr;
         create.queueCreateInfoCount = 1;
         create.pQueueCreateInfos = &queue;
         create.enabledExtensionCount =
@@ -1564,12 +1783,53 @@ private:
         const VkDeviceSize output_bytes =
             static_cast<VkDeviceSize>(maximum_width_) *
             static_cast<VkDeviceSize>(maximum_height_) * sizeof(float);
-        exported_buffer_.emplace(
-            physical_device_,
-            device_,
-            output_bytes,
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-        timeline_.emplace(physical_device_, device_, 0);
+        if (cuda_interop_) {
+#if defined(SATVIEW_HAS_CUDA)
+            exported_buffer_.emplace(
+                physical_device_,
+                device_,
+                output_bytes,
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            timeline_.emplace(physical_device_, device_, 0);
+#else
+            fail("CUDA interop resources requested by a CUDA-free build");
+#endif
+        } else {
+            VkBufferCreateInfo buffer_create{};
+            buffer_create.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            buffer_create.size = output_bytes;
+            buffer_create.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            buffer_create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            check_vk(
+                vkCreateBuffer(
+                    device_, &buffer_create, nullptr, &host_staging_buffer_),
+                "create host-staged scientific buffer");
+            VkMemoryRequirements requirements{};
+            vkGetBufferMemoryRequirements(
+                device_, host_staging_buffer_, &requirements);
+            VkMemoryAllocateInfo allocation{};
+            allocation.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = find_memory_type(
+                physical_device_,
+                requirements.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            check_vk(
+                vkAllocateMemory(
+                    device_, &allocation, nullptr, &host_staging_memory_),
+                "allocate host-staged scientific buffer");
+            check_vk(
+                vkBindBufferMemory(
+                    device_, host_staging_buffer_, host_staging_memory_, 0),
+                "bind host-staged scientific buffer");
+            check_vk(
+                vkMapMemory(
+                    device_, host_staging_memory_, 0, output_bytes, 0,
+                    &host_staging_mapping_),
+                "map host-staged scientific buffer");
+            host_staging_capacity_ = output_bytes;
+        }
 
         VkImageCreateInfo image_create{};
         image_create.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -1874,6 +2134,28 @@ private:
         image.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
 
+    void prepare_host_upload(const TileUpload& upload) {
+        if (host_staging_mapping_ == nullptr ||
+            host_staging_buffer_ == VK_NULL_HANDLE) {
+            fail("host upload requested without a Vulkan staging buffer");
+        }
+        const auto required = satview::viewer::checked_mosaic_bytes(
+            upload.height,
+            upload.width,
+            sizeof(float),
+            kMaximumMosaicBytes);
+        if (required > host_staging_capacity_ ||
+            upload.host_values.size_bytes() != required) {
+            fail("host scientific upload has an invalid byte count");
+        }
+        // The fallback backends intentionally use one persistent staging
+        // allocation. Waiting only on this renderer queue keeps its ownership
+        // simple and avoids a second full-size host allocation.
+        check_vk(vkQueueWaitIdle(queue_), "wait before host staging reuse");
+        std::memcpy(
+            host_staging_mapping_, upload.host_values.data(), required);
+    }
+
     void record_upload(
         const VkCommandBuffer command,
         const TileUpload& upload,
@@ -1916,9 +2198,15 @@ private:
         copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         copy.imageSubresource.layerCount = 1;
         copy.imageExtent = {upload.width, upload.height, 1};
+        VkBuffer source_buffer = host_staging_buffer_;
+#if defined(SATVIEW_HAS_CUDA)
+        if (cuda_interop_) {
+            source_buffer = exported_buffer_->buffer();
+        }
+#endif
         vkCmdCopyBufferToImage(
             command,
-            exported_buffer_->buffer(),
+            source_buffer,
             image.image,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             1,
@@ -2082,13 +2370,29 @@ private:
             image = ScientificImage{};
         }
         colormap_lut_.reset();
+#if defined(SATVIEW_HAS_CUDA)
         timeline_.reset();
         exported_buffer_.reset();
+#endif
+        if (host_staging_mapping_ != nullptr) {
+            vkUnmapMemory(device_, host_staging_memory_);
+            host_staging_mapping_ = nullptr;
+        }
+        if (host_staging_buffer_ != VK_NULL_HANDLE) {
+            vkDestroyBuffer(device_, host_staging_buffer_, nullptr);
+            host_staging_buffer_ = VK_NULL_HANDLE;
+        }
+        if (host_staging_memory_ != VK_NULL_HANDLE) {
+            vkFreeMemory(device_, host_staging_memory_, nullptr);
+            host_staging_memory_ = VK_NULL_HANDLE;
+        }
+        host_staging_capacity_ = 0;
     }
 
     SDL_Window* window_ = nullptr;
     std::uint32_t maximum_width_ = 0;
     std::uint32_t maximum_height_ = 0;
+    bool cuda_interop_ = false;
     VkInstance instance_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
@@ -2100,8 +2404,14 @@ private:
     bool swapchain_rebuild_ = false;
     bool imgui_initialized_ = false;
 
+#if defined(SATVIEW_HAS_CUDA)
     std::optional<satview::gpu::ExportedBuffer> exported_buffer_;
     std::optional<satview::gpu::InteropTimeline> timeline_;
+#endif
+    VkBuffer host_staging_buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory host_staging_memory_ = VK_NULL_HANDLE;
+    void* host_staging_mapping_ = nullptr;
+    VkDeviceSize host_staging_capacity_ = 0;
     std::unique_ptr<satview::viewer::VulkanColormapLut> colormap_lut_;
     std::array<ScientificImage, 2> scientific_images_{};
     VkSampler sampler_ = VK_NULL_HANDLE;
@@ -2111,7 +2421,39 @@ private:
     VkPipeline pipeline_ = VK_NULL_HANDLE;
 };
 
-class CudaTilePipeline final {
+class TilePipeline {
+public:
+    virtual ~TilePipeline() = default;
+
+    [[nodiscard]] virtual std::string_view name() const noexcept = 0;
+    [[nodiscard]] virtual bool page_locked_reads() const noexcept = 0;
+    [[nodiscard]] virtual bool timing_pending() const noexcept = 0;
+    [[nodiscard]] virtual bool has_resident_source(
+        const TileRequest& request) const noexcept = 0;
+    virtual bool poll_timing(float& upload_ms, float& processing_ms) = 0;
+    [[nodiscard]] virtual std::optional<DistributionCompletion>
+    poll_distribution() = 0;
+    virtual TileUpload redispatch(
+        const TileRequest& request,
+        std::uint64_t previous_vulkan_consumed) = 0;
+    virtual TileUpload upload_overview(
+        const TileRequest& request,
+        std::span<const std::byte> science,
+        std::optional<std::span<const std::uint8_t>> validity_mask,
+        std::uint32_t width,
+        std::uint32_t height,
+        std::size_t element_size,
+        std::uint64_t previous_vulkan_consumed) = 0;
+    virtual std::optional<TileUpload> upload_chunk(
+        ReadSlotLease ready,
+        const ReadCompletion& completion,
+        std::uint64_t previous_vulkan_consumed) = 0;
+    virtual void discard(ReadSlotLease ready) = 0;
+    virtual void set_layers(const ProductView& view) = 0;
+};
+
+#if defined(SATVIEW_HAS_CUDA)
+class CudaTilePipeline final : public TilePipeline {
 public:
     CudaTilePipeline(
         const std::size_t maximum_science_mosaic_bytes,
@@ -2169,7 +2511,7 @@ public:
         }
     }
 
-    ~CudaTilePipeline() {
+    ~CudaTilePipeline() override {
         if (stream_ != nullptr) {
             static_cast<void>(cudaStreamSynchronize(stream_));
         }
@@ -2179,17 +2521,25 @@ public:
     CudaTilePipeline(const CudaTilePipeline&) = delete;
     CudaTilePipeline& operator=(const CudaTilePipeline&) = delete;
 
-    [[nodiscard]] bool timing_pending() const noexcept {
+    [[nodiscard]] std::string_view name() const noexcept override {
+        return "CUDA";
+    }
+
+    [[nodiscard]] bool page_locked_reads() const noexcept override {
+        return true;
+    }
+
+    [[nodiscard]] bool timing_pending() const noexcept override {
         return timing_pending_ || distribution_.pending();
     }
 
     [[nodiscard]] bool has_resident_source(
-        const TileRequest& request) const noexcept {
+        const TileRequest& request) const noexcept override {
         return resident_.has_value() &&
             same_tile_source(resident_->request, request);
     }
 
-    bool poll_timing(float& h2d_ms, float& transform_ms) {
+    bool poll_timing(float& h2d_ms, float& transform_ms) override {
         if (!timing_pending_) {
             return true;
         }
@@ -2218,7 +2568,7 @@ public:
     }
 
     [[nodiscard]] std::optional<DistributionCompletion>
-    poll_distribution() {
+    poll_distribution() override {
         satview::gpu::AsyncDistributionResult result;
         if (!distribution_.poll(result)) {
             return std::nullopt;
@@ -2240,7 +2590,7 @@ public:
 
     TileUpload redispatch(
         const TileRequest& request,
-        const std::uint64_t previous_vulkan_consumed) {
+        const std::uint64_t previous_vulkan_consumed) override {
         if (timing_pending() || !has_resident_source(request)) {
             fail("invalid resident CUDA mosaic redispatch");
         }
@@ -2262,7 +2612,7 @@ public:
         const std::uint32_t width,
         const std::uint32_t height,
         const std::size_t element_size,
-        const std::uint64_t previous_vulkan_consumed) {
+        const std::uint64_t previous_vulkan_consumed) override {
         if (request.source_kind != TileSourceKind::raw_overview ||
             request.overview_identity == 0) {
             fail("raw overview upload requires a nonzero overview identity");
@@ -2359,9 +2709,9 @@ public:
     }
 
     std::optional<TileUpload> upload_chunk(
-        satview::gpu::PinnedRing::SlotLease ready,
+        ReadSlotLease ready,
         const ReadCompletion& completion,
-        const std::uint64_t previous_vulkan_consumed) {
+        const std::uint64_t previous_vulkan_consumed) override {
         if (!completion.plan.has_value() || !ready) {
             fail("invalid mosaic chunk upload");
         }
@@ -2568,13 +2918,13 @@ public:
         return launch_transform(*resident_, previous_vulkan_consumed);
     }
 
-    void discard(satview::gpu::PinnedRing::SlotLease ready) {
+    void discard(ReadSlotLease ready) override {
         if (ready) {
             ready.mark_in_flight(stream_);
         }
     }
 
-    void set_layers(const ProductView& view) {
+    void set_layers(const ProductView& view) override {
         layer_lookup_.clear();
         layer_lookup_.reserve(view.layers.size());
         for (const auto& layer : view.layers) {
@@ -2630,7 +2980,7 @@ private:
             fail("resident mosaic datatype changed before transform");
         }
         const bool filter_enabled = resident.request.speckle.filter !=
-            satview::gpu::SpeckleFilter::none;
+            satview::cpu::SpeckleFilter::none;
         const auto output_bytes = satview::viewer::checked_mosaic_bytes(
             resident.height,
             resident.width,
@@ -2711,8 +3061,25 @@ private:
                 fail("speckle filter requested for an unsupported display mode");
             }
             satview::gpu::SpeckleFilterOptions filter_options{};
-            filter_options.filter = resident.request.speckle.filter;
-            filter_options.domain = *domain;
+            filter_options.filter =
+                resident.request.speckle.filter ==
+                    satview::cpu::SpeckleFilter::lee
+                ? satview::gpu::SpeckleFilter::lee
+                : satview::gpu::SpeckleFilter::boxcar;
+            switch (*domain) {
+                case satview::cpu::SpeckleDomain::amplitude:
+                    filter_options.domain =
+                        satview::gpu::SpeckleDomain::amplitude;
+                    break;
+                case satview::cpu::SpeckleDomain::linear_power:
+                    filter_options.domain =
+                        satview::gpu::SpeckleDomain::linear_power;
+                    break;
+                case satview::cpu::SpeckleDomain::power_db:
+                    filter_options.domain =
+                        satview::gpu::SpeckleDomain::power_db;
+                    break;
+            }
             filter_options.window_size =
                 resident.request.speckle.window_size;
             filter_options.equivalent_number_of_looks =
@@ -2816,6 +3183,557 @@ private:
     std::optional<AssemblyState> assembly_;
     std::optional<ResidentMosaic> resident_;
 };
+#endif
+
+class HostTilePipeline final : public TilePipeline {
+public:
+    HostTilePipeline(
+        const ComputeBackend backend,
+        const std::size_t maximum_science_mosaic_bytes,
+        const VulkanRenderer& renderer)
+        : backend_(backend),
+          science_capacity_(maximum_science_mosaic_bytes),
+          science_words_((maximum_science_mosaic_bytes + sizeof(float) - 1) /
+                         sizeof(float)) {
+        if (backend_ == ComputeBackend::cuda) {
+            fail("host tile pipeline cannot use the CUDA backend");
+        }
+        const auto maximum_pixels = satview::viewer::checked_mosaic_bytes(
+            renderer.maximum_height(),
+            renderer.maximum_width(),
+            sizeof(std::uint8_t),
+            kMaximumMosaicBytes);
+        mask_.resize(maximum_pixels);
+        output_.resize(maximum_pixels);
+        filter_input_.resize(maximum_pixels);
+    }
+
+    [[nodiscard]] std::string_view name() const noexcept override {
+        return backend_name(backend_);
+    }
+
+    [[nodiscard]] bool page_locked_reads() const noexcept override {
+        return false;
+    }
+
+    [[nodiscard]] bool timing_pending() const noexcept override {
+        return timing_pending_;
+    }
+
+    [[nodiscard]] bool has_resident_source(
+        const TileRequest& request) const noexcept override {
+        return resident_.has_value() &&
+            same_tile_source(resident_->request, request);
+    }
+
+    bool poll_timing(float& upload_ms, float& processing_ms) override {
+        if (!timing_pending_) {
+            return true;
+        }
+        upload_ms = upload_milliseconds_;
+        processing_ms = processing_milliseconds_;
+        timing_pending_ = false;
+        return true;
+    }
+
+    [[nodiscard]] std::optional<DistributionCompletion>
+    poll_distribution() override {
+        return std::exchange(distribution_, std::nullopt);
+    }
+
+    TileUpload redispatch(
+        const TileRequest& request,
+        const std::uint64_t previous_vulkan_consumed) override {
+        static_cast<void>(previous_vulkan_consumed);
+        if (timing_pending() || !has_resident_source(request)) {
+            fail("invalid resident host mosaic redispatch");
+        }
+        upload_milliseconds_ = 0.0F;
+        resident_->request = request;
+        return launch_transform(*resident_);
+    }
+
+    TileUpload upload_overview(
+        const TileRequest& request,
+        const std::span<const std::byte> science,
+        const std::optional<std::span<const std::uint8_t>> validity_mask,
+        const std::uint32_t width,
+        const std::uint32_t height,
+        const std::size_t element_size,
+        const std::uint64_t previous_vulkan_consumed) override {
+        static_cast<void>(previous_vulkan_consumed);
+        if (request.source_kind != TileSourceKind::raw_overview ||
+            request.overview_identity == 0) {
+            fail("raw overview upload requires a nonzero overview identity");
+        }
+        if (timing_pending()) {
+            fail("overview source overwritten before host processing completion");
+        }
+        assembly_.reset();
+        if (width == 0 || height == 0) {
+            fail("raw overview extent is empty");
+        }
+        if (request.layer_index >= layer_lookup_.size() ||
+            layer_lookup_[request.layer_index] == nullptr) {
+            fail("raw overview references an invalid layer");
+        }
+        const auto& dataset = *layer_lookup_[request.layer_index];
+        if (element_size == 0 || dataset.data_type.element_size != element_size) {
+            fail("raw overview datatype does not match its layer");
+        }
+        const auto expected_science_bytes =
+            satview::viewer::checked_mosaic_bytes(
+                height, width, element_size, kMaximumMosaicBytes);
+        const auto expected_mask_bytes =
+            satview::viewer::checked_mosaic_bytes(
+                height, width, sizeof(std::uint8_t), kMaximumMosaicBytes);
+        if (science.size() != expected_science_bytes ||
+            expected_science_bytes > science_capacity_ ||
+            expected_mask_bytes > mask_.size() ||
+            (validity_mask.has_value() &&
+             validity_mask->size() != expected_mask_bytes)) {
+            fail("raw overview payload exceeds host capacity");
+        }
+
+        resident_.reset();
+        const auto started = Clock::now();
+        std::memcpy(science_bytes().data(), science.data(), science.size());
+        if (validity_mask.has_value()) {
+            std::memcpy(
+                mask_.data(), validity_mask->data(), validity_mask->size());
+        }
+        upload_milliseconds_ = static_cast<float>(
+            std::chrono::duration<double, std::milli>(Clock::now() - started)
+                .count());
+        resident_ = ResidentMosaic{
+            .request = request,
+            .width = width,
+            .height = height,
+            .element_size = element_size,
+            .has_validity = validity_mask.has_value(),
+        };
+        return launch_transform(*resident_);
+    }
+
+    std::optional<TileUpload> upload_chunk(
+        ReadSlotLease ready,
+        const ReadCompletion& completion,
+        const std::uint64_t previous_vulkan_consumed) override {
+        static_cast<void>(previous_vulkan_consumed);
+        if (!completion.plan.has_value() || !ready) {
+            fail("invalid host mosaic chunk upload");
+        }
+        if (completion.request.source_kind != TileSourceKind::native_mosaic ||
+            completion.request.overview_identity != 0) {
+            fail("native mosaic upload has an invalid source identity");
+        }
+        if (timing_pending()) {
+            fail("mosaic source overwritten before host processing completion");
+        }
+        const auto& plan = *completion.plan;
+        const auto expected_chunks = static_cast<std::uint32_t>(
+            completion.request.mosaic.chunk_rows *
+            completion.request.mosaic.chunk_columns);
+        if (expected_chunks == 0 || expected_chunks > kMaximumMosaicChunks ||
+            completion.chunk_count != expected_chunks ||
+            completion.chunk_index >= expected_chunks) {
+            fail("invalid mosaic chunk ordinal");
+        }
+        std::size_t packed_bytes = plan.expected_bytes;
+        if (completion.mask_plan.has_value()) {
+            if (completion.mask_plan->expected_bytes >
+                std::numeric_limits<std::size_t>::max() - packed_bytes) {
+                fail("packed validity-mask byte count overflow");
+            }
+            packed_bytes += completion.mask_plan->expected_bytes;
+        }
+        if (packed_bytes != ready.bytes().size()) {
+            fail("host payload does not match mosaic chunk plans");
+        }
+
+        if (!assembly_.has_value() ||
+            assembly_->request.serial != completion.request.serial) {
+            if (completion.chunk_index != 0) {
+                fail("mosaic assembly did not begin with chunk zero");
+            }
+            const auto science_bytes_required =
+                satview::viewer::checked_mosaic_bytes(
+                    completion.request.mosaic.pixel_height,
+                    completion.request.mosaic.pixel_width,
+                    plan.data_type.element_size,
+                    kMaximumMosaicBytes);
+            if (science_bytes_required > science_capacity_) {
+                fail("science mosaic exceeds persistent host allocation");
+            }
+            resident_.reset();
+            assembly_ = AssemblyState{
+                .request = completion.request,
+                .element_size = plan.data_type.element_size,
+                .has_validity = completion.mask_plan.has_value(),
+                .expected_chunks = expected_chunks,
+                .uploaded_chunks = 0,
+            };
+            assembly_upload_milliseconds_ = 0.0;
+        }
+        if (!same_tile_source(assembly_->request, completion.request) ||
+            assembly_->request.serial != completion.request.serial ||
+            assembly_->element_size != plan.data_type.element_size ||
+            assembly_->has_validity != completion.mask_plan.has_value() ||
+            completion.chunk_index != assembly_->uploaded_chunks) {
+            fail("mosaic chunks arrived with inconsistent assembly metadata");
+        }
+
+        const auto started = Clock::now();
+        const auto mosaic_width = static_cast<std::size_t>(
+            completion.request.mosaic.pixel_width);
+        const auto mosaic_height = static_cast<std::size_t>(
+            completion.request.mosaic.pixel_height);
+        const auto source_width = static_cast<std::size_t>(plan.aligned.width);
+        const auto source_height = static_cast<std::size_t>(plan.aligned.height);
+        const auto element_size = plan.data_type.element_size;
+        const auto destination_row = static_cast<std::size_t>(
+            completion.destination_row);
+        const auto destination_column = static_cast<std::size_t>(
+            completion.destination_column);
+        if (source_width > std::numeric_limits<std::size_t>::max() /
+                element_size ||
+            mosaic_width > std::numeric_limits<std::size_t>::max() /
+                element_size ||
+            destination_row > mosaic_height ||
+            destination_column > mosaic_width ||
+            source_height > mosaic_height - destination_row ||
+            source_width > mosaic_width - destination_column) {
+            fail("host chunk destination escapes mosaic bounds");
+        }
+        const auto source_pitch = source_width * element_size;
+        const auto mosaic_pitch = mosaic_width * element_size;
+        if (source_height != 0 &&
+            (source_pitch > std::numeric_limits<std::size_t>::max() /
+                 source_height ||
+             source_pitch * source_height != plan.expected_bytes)) {
+            fail("science chunk byte count does not match its 2D extent");
+        }
+        auto destination = science_bytes();
+        for (std::size_t row = 0; row < source_height; ++row) {
+            const auto destination_offset =
+                (destination_row + row) * mosaic_pitch +
+                destination_column * element_size;
+            std::memcpy(
+                destination.data() + destination_offset,
+                ready.bytes().data() + row * source_pitch,
+                source_pitch);
+        }
+
+        if (completion.mask_plan.has_value()) {
+            const auto& mask_plan = *completion.mask_plan;
+            if (mask_plan.data_type.kind !=
+                    satview::ScalarKind::unsigned_integer ||
+                mask_plan.data_type.element_size != sizeof(std::uint8_t) ||
+                mask_plan.requested.row != plan.aligned.row ||
+                mask_plan.requested.column != plan.aligned.column ||
+                mask_plan.requested.height != plan.aligned.height ||
+                mask_plan.requested.width != plan.aligned.width ||
+                mask_plan.requested_row_offset > mask_plan.aligned.height ||
+                mask_plan.requested_column_offset > mask_plan.aligned.width ||
+                plan.aligned.height > mask_plan.aligned.height -
+                    mask_plan.requested_row_offset ||
+                plan.aligned.width > mask_plan.aligned.width -
+                    mask_plan.requested_column_offset) {
+                fail("validity-mask plan does not match its science chunk");
+            }
+            const auto mask_source_offset = static_cast<std::size_t>(
+                mask_plan.requested_row_offset * mask_plan.aligned.width +
+                mask_plan.requested_column_offset);
+            const auto* const mask_source =
+                reinterpret_cast<const std::uint8_t*>(
+                    ready.bytes().data() + plan.expected_bytes) +
+                mask_source_offset;
+            const auto mask_source_pitch = static_cast<std::size_t>(
+                mask_plan.aligned.width);
+            for (std::size_t row = 0; row < source_height; ++row) {
+                std::memcpy(
+                    mask_.data() +
+                        (destination_row + row) * mosaic_width +
+                        destination_column,
+                    mask_source + row * mask_source_pitch,
+                    source_width);
+            }
+        }
+        ready.mark_consumed();
+        assembly_upload_milliseconds_ +=
+            std::chrono::duration<double, std::milli>(Clock::now() - started)
+                .count();
+
+        ++assembly_->uploaded_chunks;
+        if (assembly_->uploaded_chunks != assembly_->expected_chunks) {
+            return std::nullopt;
+        }
+        resident_ = ResidentMosaic{
+            .request = assembly_->request,
+            .width = static_cast<std::uint32_t>(
+                assembly_->request.mosaic.pixel_width),
+            .height = static_cast<std::uint32_t>(
+                assembly_->request.mosaic.pixel_height),
+            .element_size = assembly_->element_size,
+            .has_validity = assembly_->has_validity,
+        };
+        upload_milliseconds_ =
+            static_cast<float>(assembly_upload_milliseconds_);
+        assembly_.reset();
+        return launch_transform(*resident_);
+    }
+
+    void discard(ReadSlotLease ready) override {
+        if (ready) {
+            ready.mark_consumed();
+        }
+    }
+
+    void set_layers(const ProductView& view) override {
+        layer_lookup_.clear();
+        layer_lookup_.reserve(view.layers.size());
+        for (const auto& layer : view.layers) {
+            layer_lookup_.push_back(layer.dataset);
+        }
+    }
+
+private:
+    struct AssemblyState {
+        TileRequest request;
+        std::size_t element_size = 0;
+        bool has_validity = false;
+        std::uint32_t expected_chunks = 0;
+        std::uint32_t uploaded_chunks = 0;
+    };
+
+    struct ResidentMosaic {
+        TileRequest request;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        std::size_t element_size = 0;
+        bool has_validity = false;
+    };
+
+    [[nodiscard]] std::span<std::byte> science_bytes() noexcept {
+        return std::as_writable_bytes(std::span<float>(science_words_));
+    }
+
+    [[nodiscard]] static satview::cpu::SpeckleDomain cpu_speckle_domain(
+        const satview::cpu::SpeckleDomain domain) {
+        switch (domain) {
+            case satview::cpu::SpeckleDomain::amplitude:
+                return satview::cpu::SpeckleDomain::amplitude;
+            case satview::cpu::SpeckleDomain::linear_power:
+                return satview::cpu::SpeckleDomain::linear_power;
+            case satview::cpu::SpeckleDomain::power_db:
+                return satview::cpu::SpeckleDomain::power_db;
+        }
+        fail("invalid speckle domain");
+    }
+
+    [[nodiscard]] satview::experimental::PageRequest make_page_request(
+        const ResidentMosaic& resident,
+        const satview::DatasetInfo& dataset,
+        const std::span<const std::uint8_t> validity) const {
+        const auto count = static_cast<std::size_t>(resident.width) *
+            static_cast<std::size_t>(resident.height);
+        satview::experimental::PageRequest request;
+        request.science = std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(science_words_.data()),
+            count * resident.element_size);
+        request.validity = validity;
+        request.width = resident.width;
+        request.height = resident.height;
+        if (dataset.data_type.kind ==
+            satview::ScalarKind::compound_complex) {
+            request.input_kind =
+                satview::experimental::InputKind::complex_float32;
+            if (dataset.layer_kind == satview::LayerKind::gslc_polarization) {
+                switch (resident.request.mode) {
+                    case DisplayMode::amplitude:
+                        request.complex_transform =
+                            satview::cpu::ComplexTransform::amplitude;
+                        break;
+                    case DisplayMode::power:
+                        request.complex_transform =
+                            satview::cpu::ComplexTransform::power;
+                        break;
+                    case DisplayMode::power_db:
+                        request.complex_transform =
+                            satview::cpu::ComplexTransform::power_db;
+                        break;
+                    case DisplayMode::phase:
+                        request.complex_transform =
+                            satview::cpu::ComplexTransform::phase;
+                        break;
+                    case DisplayMode::real:
+                        request.complex_transform =
+                            satview::cpu::ComplexTransform::real;
+                        break;
+                    case DisplayMode::imaginary:
+                        request.complex_transform =
+                            satview::cpu::ComplexTransform::imaginary;
+                        break;
+                    default:
+                        fail("unsupported GSLC host display mode");
+                }
+            } else {
+                request.complex_transform =
+                    resident.request.mode == DisplayMode::phase
+                    ? satview::cpu::ComplexTransform::phase
+                    : satview::cpu::ComplexTransform::amplitude;
+            }
+        } else {
+            request.input_kind = satview::experimental::InputKind::real_float32;
+            request.real_transform =
+                resident.request.mode == DisplayMode::power_db
+                ? satview::cpu::RealTransform::power_db
+                : satview::cpu::RealTransform::linear;
+        }
+        request.filter_enabled = resident.request.speckle.filter !=
+            satview::cpu::SpeckleFilter::none;
+        if (request.filter_enabled) {
+            const auto domain = speckle_domain_for(
+                dataset, resident.request.mode);
+            if (!domain.has_value()) {
+                fail("speckle filter requested for an unsupported display mode");
+            }
+            request.speckle.filter =
+                resident.request.speckle.filter ==
+                    satview::cpu::SpeckleFilter::lee
+                ? satview::cpu::SpeckleFilter::lee
+                : satview::cpu::SpeckleFilter::boxcar;
+            request.speckle.domain = cpu_speckle_domain(*domain);
+            request.speckle.window_size =
+                resident.request.speckle.window_size;
+            request.speckle.equivalent_number_of_looks =
+                resident.request.speckle.equivalent_number_of_looks;
+        }
+        return request;
+    }
+
+    void process_cpu(
+        const satview::experimental::PageRequest& request,
+        const std::span<float> output) {
+        const auto count = output.size();
+        auto transformed = request.filter_enabled
+            ? std::span<float>(filter_input_).first(count)
+            : output;
+        if (request.input_kind ==
+            satview::experimental::InputKind::complex_float32) {
+            const auto* const input =
+                reinterpret_cast<const satview::cpu::Complex32*>(
+                    request.science.data());
+            satview::cpu::transform_complex(
+                std::span<const satview::cpu::Complex32>(input, count),
+                transformed,
+                request.complex_transform,
+                request.validity);
+        } else {
+            const auto* const input = reinterpret_cast<const float*>(
+                request.science.data());
+            satview::cpu::transform_real(
+                std::span<const float>(input, count),
+                transformed,
+                request.real_transform,
+                request.validity);
+        }
+        if (request.filter_enabled) {
+            satview::cpu::filter_speckle(
+                transformed,
+                output,
+                request.width,
+                request.height,
+                request.speckle,
+                request.validity);
+        }
+    }
+
+    TileUpload launch_transform(const ResidentMosaic& resident) {
+        const auto count = satview::viewer::checked_mosaic_bytes(
+            resident.height,
+            resident.width,
+            sizeof(std::uint8_t),
+            kMaximumMosaicBytes);
+        const auto& dataset =
+            resident.request.layer_index < layer_lookup_.size() &&
+                layer_lookup_[resident.request.layer_index] != nullptr
+            ? *layer_lookup_[resident.request.layer_index]
+            : throw std::runtime_error("invalid layer dispatch index");
+        if (dataset.data_type.element_size != resident.element_size ||
+            count > output_.size()) {
+            fail("resident host mosaic datatype or extent is invalid");
+        }
+        const auto validity = resident.has_validity
+            ? std::span<const std::uint8_t>(mask_).first(count)
+            : std::span<const std::uint8_t>{};
+        const auto request = make_page_request(resident, dataset, validity);
+        const auto output = std::span<float>(output_).first(count);
+        const auto started = Clock::now();
+        switch (backend_) {
+            case ComputeBackend::cpu:
+                process_cpu(request, output);
+                break;
+            case ComputeBackend::hip:
+#if defined(SATVIEW_HAS_EXPERIMENTAL_HIP)
+                satview::experimental::process_hip(request, output);
+                break;
+#else
+                fail("experimental HIP backend was not compiled");
+#endif
+            case ComputeBackend::sycl:
+#if defined(SATVIEW_HAS_EXPERIMENTAL_SYCL)
+                satview::experimental::process_sycl(request, output);
+                break;
+#else
+                fail("experimental SYCL backend was not compiled");
+#endif
+            case ComputeBackend::cuda:
+                fail("CUDA dispatch reached the host tile pipeline");
+        }
+        processing_milliseconds_ = static_cast<float>(
+            std::chrono::duration<double, std::milli>(Clock::now() - started)
+                .count());
+        timing_pending_ = true;
+
+        const auto cpu_histogram = satview::cpu::build_histogram(output);
+        satview::gpu::DistributionHistogram histogram;
+        histogram.finite_count = cpu_histogram.finite_count;
+        histogram.invalid_count = cpu_histogram.invalid_count;
+        histogram.minimum = cpu_histogram.minimum;
+        histogram.maximum = cpu_histogram.maximum;
+        histogram.bins = cpu_histogram.bins;
+        distribution_ = DistributionCompletion{
+            .request = resident.request,
+            .summary = satview::gpu::summarize_distribution(histogram),
+            .elapsed_milliseconds = 0.0F,
+            .width = resident.width,
+            .height = resident.height,
+        };
+        return TileUpload{
+            .request = resident.request,
+            .width = resident.width,
+            .height = resident.height,
+            .host_values = output,
+        };
+    }
+
+    ComputeBackend backend_ = ComputeBackend::cpu;
+    std::size_t science_capacity_ = 0;
+    std::vector<float> science_words_;
+    std::vector<std::uint8_t> mask_;
+    std::vector<float> output_;
+    std::vector<float> filter_input_;
+    float upload_milliseconds_ = 0.0F;
+    float processing_milliseconds_ = 0.0F;
+    double assembly_upload_milliseconds_ = 0.0;
+    bool timing_pending_ = false;
+    std::vector<const satview::DatasetInfo*> layer_lookup_;
+    std::optional<AssemblyState> assembly_;
+    std::optional<ResidentMosaic> resident_;
+    std::optional<DistributionCompletion> distribution_;
+};
+
 class SdlSession final {
 public:
     SdlSession() {
@@ -2826,7 +3744,7 @@ public:
         }
         const float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
         window_ = SDL_CreateWindow(
-            "NISAR GPU Viewer",
+            "NISAR Data Reader",
             static_cast<int>(1440.0F * scale),
             static_cast<int>(900.0F * scale),
             SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE |
@@ -2997,10 +3915,10 @@ void draw_numeric_display_controls(
         "Boxcar mean",
         "Lee adaptive",
     }};
-    constexpr std::array<satview::gpu::SpeckleFilter, 3> filters{{
-        satview::gpu::SpeckleFilter::none,
-        satview::gpu::SpeckleFilter::boxcar,
-        satview::gpu::SpeckleFilter::lee,
+    constexpr std::array<satview::cpu::SpeckleFilter, 3> filters{{
+        satview::cpu::SpeckleFilter::none,
+        satview::cpu::SpeckleFilter::boxcar,
+        satview::cpu::SpeckleFilter::lee,
     }};
     const bool supported = speckle_domain_for(layer, mode).has_value();
     auto filter_iterator =
@@ -3024,7 +3942,7 @@ void draw_numeric_display_controls(
     }
 
     const bool filtering = supported &&
-        settings.filter != satview::gpu::SpeckleFilter::none;
+        settings.filter != satview::cpu::SpeckleFilter::none;
     if (!filtering) {
         ImGui::BeginDisabled();
     }
@@ -3048,7 +3966,7 @@ void draw_numeric_display_controls(
         ImGui::EndDisabled();
     }
 
-    if (filtering && settings.filter == satview::gpu::SpeckleFilter::lee) {
+    if (filtering && settings.filter == satview::cpu::SpeckleFilter::lee) {
         float looks_candidate = settings.equivalent_number_of_looks;
         const float looks_step = std::max(0.1F, looks_candidate * 0.1F);
         const float looks_fast_step = std::min(
@@ -3532,8 +4450,9 @@ ViewportUiResult build_ui(
     const double hdf5_ms,
     const float h2d_ms,
     const float transform_ms,
+    const std::string_view compute_backend,
     const std::string& status,
-    const satview::gpu::PinnedRing::StateCounts ring) {
+    const ReadRingState ring) {
     ViewportUiResult result;
     bool focus_control_changed = false;
     bool frame_selected_footprint = false;
@@ -3572,7 +4491,11 @@ ViewportUiResult build_ui(
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("%s", product.file_path().string().c_str());
         }
-        ImGui::Text("GPU: %s", renderer.device_name().c_str());
+        ImGui::Text(
+            "GPU: %s | %.*s",
+            renderer.device_name().c_str(),
+            static_cast<int>(compute_backend.size()),
+            compute_backend.data());
 
         const char* selected_label = view.layers[selected_layer].label.c_str();
         if (ImGui::BeginCombo("Semantic layer", selected_label)) {
@@ -3755,11 +4678,11 @@ ViewportUiResult build_ui(
             ImGui::TextWrapped("%s", status.c_str());
         }
         ImGui::Text("Source/prepare    %8.3f ms", hdf5_ms);
-        ImGui::Text("Pinned H2D total  %8.3f ms", h2d_ms);
-        ImGui::Text("CUDA processing   %8.3f ms", transform_ms);
+        ImGui::Text("Upload             %8.3f ms", h2d_ms);
+        ImGui::Text("Processing         %8.3f ms", transform_ms);
         ImGui::Text("Frame              %8.3f ms",
                     1000.0F / std::max(ImGui::GetIO().Framerate, 0.001F));
-        ImGui::Text("Pinned ring F/R/G/I: %zu/%zu/%zu/%zu", ring.free,
+        ImGui::Text("Read ring F/R/G/I: %zu/%zu/%zu/%zu", ring.free,
                     ring.ready, ring.filling, ring.in_flight);
         ImGui::End();
     }
@@ -4267,9 +5190,11 @@ ViewportUiResult build_ui(
 
 [[nodiscard]] std::optional<std::filesystem::path> run_file_launcher(
     const std::optional<std::uint64_t> frame_limit,
-    const std::string_view initial_error) {
+    const std::string_view initial_error,
+    const ComputeBackend backend) {
     SdlSession sdl;
-    VulkanRenderer renderer(sdl.window(), 1, 1);
+    VulkanRenderer renderer(
+        sdl.window(), 1, 1, backend == ComputeBackend::cuda);
     ImGuiSession imgui(sdl.window(), renderer);
     DisplayPushConstants display;
     std::string error(initial_error);
@@ -4353,20 +5278,33 @@ ViewportUiResult build_ui(
     }
 }
 
-int run(const Arguments& arguments) {
+int run(const Arguments& arguments, const ComputeBackend backend) {
     satview::Hdf5Product product(arguments.file);
     const ProductView product_view = build_product_view(product);
-    TileReader reader(product, product_view);
-    satview::viewer::OverviewWorker overview_worker(product);
     SdlSession sdl;
     VulkanRenderer renderer(
         sdl.window(),
         product_view.maximum_mosaic_width,
-        product_view.maximum_mosaic_height);
+        product_view.maximum_mosaic_height,
+        backend == ComputeBackend::cuda);
     ImGuiSession imgui(sdl.window(), renderer);
-    CudaTilePipeline cuda(
-        product_view.maximum_science_mosaic_bytes, renderer);
-    cuda.set_layers(product_view);
+    std::unique_ptr<TilePipeline> pipeline;
+    if (backend == ComputeBackend::cuda) {
+#if defined(SATVIEW_HAS_CUDA)
+        pipeline = std::make_unique<CudaTilePipeline>(
+            product_view.maximum_science_mosaic_bytes, renderer);
+#else
+        fail("CUDA backend selected by a CUDA-free viewer build");
+#endif
+    } else {
+        pipeline = std::make_unique<HostTilePipeline>(
+            backend,
+            product_view.maximum_science_mosaic_bytes,
+            renderer);
+    }
+    pipeline->set_layers(product_view);
+    TileReader reader(product, product_view, pipeline->page_locked_reads());
+    satview::viewer::OverviewWorker overview_worker(product);
 
     std::size_t selected_layer = product_view.default_layer;
     std::size_t scheduled_layer = selected_layer;
@@ -4426,7 +5364,7 @@ int run(const Arguments& arguments) {
     float h2d_ms = 0.0F;
     float transform_ms = 0.0F;
     std::string overview_error;
-    std::string status = "Opening continuous GPU scene pipeline";
+    std::string status = "Opening scene pipeline";
     std::uint32_t image_width = 1;
     std::uint32_t image_height = 1;
     std::uint64_t presented_frames = 0;
@@ -4491,8 +5429,8 @@ int run(const Arguments& arguments) {
 
         renderer.resize_if_needed();
         static_cast<void>(reader.reclaim_completed());
-        static_cast<void>(cuda.poll_timing(h2d_ms, transform_ms));
-        if (auto distribution = cuda.poll_distribution()) {
+        static_cast<void>(pipeline->poll_timing(h2d_ms, transform_ms));
+        if (auto distribution = pipeline->poll_distribution()) {
             distribution_cache.push_back(std::move(*distribution));
             constexpr std::size_t maximum_cached_distributions = 4;
             while (distribution_cache.size() > maximum_cached_distributions) {
@@ -4586,7 +5524,7 @@ int run(const Arguments& arguments) {
                 continue;
             }
             if (completion.request.serial == latest_native_serial &&
-                (pending_upload.has_value() || cuda.timing_pending() ||
+                (pending_upload.has_value() || pipeline->timing_pending() ||
                  outgoing_slot.has_value())) {
                 break;
             }
@@ -4595,7 +5533,7 @@ int run(const Arguments& arguments) {
                 break;
             }
             if (completion.request.serial != latest_native_serial) {
-                cuda.discard(std::move(ready));
+                pipeline->discard(std::move(ready));
                 deferred_completion.reset();
                 continue;
             }
@@ -4603,7 +5541,7 @@ int run(const Arguments& arguments) {
             hdf5_ms += completion.hdf5_milliseconds;
             const auto completed_chunks = completion.chunk_index + 1;
             const auto expected_chunks = completion.chunk_count;
-            auto upload = cuda.upload_chunk(
+            auto upload = pipeline->upload_chunk(
                 std::move(ready),
                 completion,
                 last_vulkan_consumed);
@@ -4616,19 +5554,18 @@ int run(const Arguments& arguments) {
                 overview_worker.set_foreground_active(false);
                 image_width = pending_upload->width;
                 image_height = pending_upload->height;
-                status =
-                    "Exact native scene transformed; publication pending";
+                status = "Exact native scene ready; publication pending";
                 break;
             }
             std::ostringstream progress;
-            progress << "GPU native assembly " << completed_chunks << '/'
+            progress << "Native assembly " << completed_chunks << '/'
                      << expected_chunks << " chunks";
             status = progress.str();
         }
 
         if (queued_request.has_value() &&
             !active_native_request.has_value() &&
-            !pending_upload.has_value() && !cuda.timing_pending() &&
+            !pending_upload.has_value() && !pipeline->timing_pending() &&
             !outgoing_slot.has_value()) {
             const TileRequest request = *queued_request;
             if (request.source_kind == TileSourceKind::raw_overview) {
@@ -4642,11 +5579,11 @@ int run(const Arguments& arguments) {
                     request_deadline = Clock::now();
                 } else {
                     pending_mapping = overview_mapping(*prepared_overview);
-                    if (cuda.has_resident_source(request)) {
-                        pending_upload = cuda.redispatch(
+                    if (pipeline->has_resident_source(request)) {
+                        pending_upload = pipeline->redispatch(
                             request, last_vulkan_consumed);
                         status =
-                            "Resident LOD page reused; CUDA processing queued";
+                            "Resident LOD page reused; processing queued";
                     } else {
                         const auto& plan = *prepared_overview->plan;
                         std::optional<std::span<const std::uint8_t>> mask;
@@ -4656,7 +5593,7 @@ int run(const Arguments& arguments) {
                                     prepared_overview->mask_bytes.data()),
                                 prepared_overview->mask_bytes.size());
                         }
-                        pending_upload = cuda.upload_overview(
+                        pending_upload = pipeline->upload_overview(
                             request,
                             prepared_overview->science_bytes,
                             mask,
@@ -4678,16 +5615,16 @@ int run(const Arguments& arguments) {
                                 framebuffer_scale_y);
                         status = describe_lod_page(
                             plan,
-                            "memory only, GPU upload queued",
+                            "memory only, publication queued",
                             overview_density);
                     }
                     image_width = pending_upload->width;
                     image_height = pending_upload->height;
                     queued_request.reset();
                 }
-            } else if (cuda.has_resident_source(request)) {
+            } else if (pipeline->has_resident_source(request)) {
                 pending_mapping = native_mapping(request);
-                pending_upload = cuda.redispatch(
+                pending_upload = pipeline->redispatch(
                     request, last_vulkan_consumed);
                 image_width = pending_upload->width;
                 image_height = pending_upload->height;
@@ -4695,7 +5632,7 @@ int run(const Arguments& arguments) {
                 overview_worker.set_foreground_active(false);
                 queued_request.reset();
                 status =
-                    "Resident native scene reused; CUDA processing queued";
+                    "Resident native scene reused; processing queued";
             } else {
                 reader.request(request);
                 active_native_request = request;
@@ -4795,6 +5732,7 @@ int run(const Arguments& arguments) {
             hdf5_ms,
             h2d_ms,
             transform_ms,
+            pipeline->name(),
             status,
             reader.ring_state());
 
@@ -5584,8 +6522,9 @@ int run(const Arguments& arguments) {
                       << hdf5_ms << " ms, ";
         }
         std::cout << smoke_image_frames
-                  << " post-upload frames, H2D " << h2d_ms
-                  << " ms, CUDA " << transform_ms << " ms\n";
+                  << " post-upload frames, upload " << h2d_ms
+                  << " ms, " << pipeline->name() << ' '
+                  << transform_ms << " ms\n";
     }
     return 0;
 }
@@ -5594,20 +6533,21 @@ int run(const Arguments& arguments) {
 int main(int argc, char** argv) {
     try {
         Arguments arguments = parse_arguments(argc, argv);
+        const ComputeBackend backend = select_backend(arguments.backend);
         if (!arguments.file.empty()) {
-            return run(arguments);
+            return run(arguments, backend);
         }
 
         std::string open_error;
         while (true) {
             const auto selected = run_file_launcher(
-                arguments.frame_limit, open_error);
+                arguments.frame_limit, open_error, backend);
             if (!selected.has_value()) {
                 return 0;
             }
             arguments.file = *selected;
             try {
-                return run(arguments);
+                return run(arguments, backend);
             } catch (const std::exception& error) {
                 open_error = error.what();
                 arguments.file.clear();

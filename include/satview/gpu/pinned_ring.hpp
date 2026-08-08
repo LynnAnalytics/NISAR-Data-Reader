@@ -49,6 +49,10 @@ class PinnedRing final {
     std::size_t slot_count;
     std::size_t bytes_per_slot;
     unsigned int host_alloc_flags = cudaHostAllocDefault;
+    // CPU and experimental backends do not require CUDA page locking or
+    // completion events. Their consumers release a Ready slot synchronously
+    // with mark_consumed().
+    bool page_locked = true;
   };
 
   struct StateCounts {
@@ -89,6 +93,10 @@ class PinnedRing final {
     // copy, then transition Ready -> InFlight. On CUDA error the lease remains
     // valid and is returned to Ready when destroyed.
     void mark_in_flight(cudaStream_t stream);
+
+    // Transition Ready -> Free after a synchronous consumer has finished
+    // reading the slot. This is the non-CUDA counterpart to mark_in_flight.
+    void mark_consumed();
 
     // Release without publishing/submitting. A Filling lease returns to Free;
     // a Ready lease returns to the ready queue.

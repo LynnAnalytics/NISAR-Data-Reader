@@ -653,6 +653,31 @@ int test_pinned_ring(const cudaStream_t stream) {
         failures);
 
     {
+        PinnedRing ring{PinnedRing::Options{
+            .slot_count = 1,
+            .bytes_per_slot = 64,
+            .page_locked = false,
+        }};
+        expect(
+            ring.total_pinned_bytes() == 0,
+            "pageable ring reports no CUDA-pinned bytes",
+            failures);
+        auto fill = ring.try_acquire_for_fill();
+        fill.bytes()[0] = std::byte{0x5A};
+        fill.publish_ready(1);
+        auto ready = ring.try_acquire_ready();
+        expect(
+            ready && ready.bytes()[0] == std::byte{0x5A},
+            "pageable ring preserves published bytes",
+            failures);
+        ready.mark_consumed();
+        expect_counts(
+            ring.state_counts(), 1, 0, 0, 0,
+            "synchronous consumption returns a pageable slot to Free",
+            failures);
+    }
+
+    {
         PinnedRing ring{2, 256};
         expect(
             ring.slot_count() == 2 && ring.bytes_per_slot() == 256 &&

@@ -47,11 +47,11 @@
     {
       "name": "cpu-dev",
       "inherits": "base",
-      "displayName": "Development (CPU diagnostics only)",
+      "displayName": "Development (CPU viewer)",
       "cacheVariables": {
         "SATVIEW_ENABLE_CUDA": "OFF",
         "SATVIEW_BUILD_TESTS": "ON",
-        "SATVIEW_BUILD_VIEWER": "OFF"
+        "SATVIEW_BUILD_VIEWER": "ON"
       }
     }
   ],
@@ -91,6 +91,14 @@
       "output": {
         "outputOnFailure": true
       }
+    },
+    {
+      "name": "cpu-dev",
+      "configurePreset": "cpu-dev",
+      "configuration": "RelWithDebInfo",
+      "output": {
+        "outputOnFailure": true
+      }
     }
   ]
-}
+}

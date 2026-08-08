@@ -70,11 +70,12 @@ at least one texel per physical framebuffer pixel. The planner still targets
 tests cover reuse across an LOD boundary and expiry below the density floor.
 This adds no page cache, disk writes, or extra resident page.
 
-The v0.5.4 blank launcher initializes only a 1x1 scientific backing resource;
+The v0.6.0 blank launcher initializes only a 1x1 scientific backing resource;
 product-sized resident allocations and HDF5 workers are deferred until a file
 is selected. A four-frame blank Release launch exits successfully, and the
-direct 4x4 GCOV smoke remains compatible at 41.8429 ms HDF5, 1.48829 ms H2D,
-and 1.14214 ms CUDA for that observation.
+same 4x4 GCOV smoke passed at 41.95 ms HDF5, 0.666 ms upload, and 0.977 ms
+CUDA. Forced CPU in that build measured 51.01 ms HDF5, 2.22 ms upload, and
+2.85 ms processing; the CUDA-free automatic path also passed.
 
 ## Overlapped pipeline results
 
