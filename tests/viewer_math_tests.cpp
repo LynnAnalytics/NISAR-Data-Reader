@@ -237,6 +237,20 @@ void test_checked_mosaic_bytes(int& failures) {
         failures);
 }
 
+void test_ceil_div_boundaries(int& failures) {
+    using satview::viewer::detail::ceil_div;
+
+    constexpr auto maximum = std::numeric_limits<std::uint64_t>::max();
+    expect(
+        ceil_div(maximum, 2) == maximum / 2 + 1,
+        "ceiling division does not overflow at the uint64 boundary",
+        failures);
+    expect(
+        ceil_div(maximum, maximum) == 1,
+        "ceiling division handles a maximum-sized divisor",
+        failures);
+}
+
 void test_maximum_chunk_aligned_extent(int& failures) {
     using satview::viewer::maximum_chunk_aligned_extent;
 
@@ -275,6 +289,7 @@ int run_viewer_math_tests() {
     int failures = 0;
     test_mosaic_geometry(failures);
     test_checked_mosaic_bytes(failures);
+    test_ceil_div_boundaries(failures);
     test_maximum_chunk_aligned_extent(failures);
     return failures;
 }

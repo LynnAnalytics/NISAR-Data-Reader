@@ -1,30 +1,45 @@
 #include "satview/hdf5_product.hpp"
 
 #include <hdf5.h>
+#include <H5PLpublic.h>
 #include <zlib.h>
 
 #include <algorithm>
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <list>
 #include <limits>
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace satview {
 namespace {
 
-// The pinned vcpkg HDF5 build is not thread-safe. The viewer deliberately uses
-// one reader thread, and this process-wide lock also keeps multiple product
-// objects safe if callers inspect them concurrently.
+// The pinned vcpkg HDF5 build is not thread-safe. Tile and overview reads may
+// overlap, so every HDF5 call is serialized process-wide, including calls from
+// callers that inspect multiple products concurrently.
 std::recursive_mutex& global_hdf5_mutex() {
     static std::recursive_mutex mutex;
     return mutex;
 }
+
+constexpr std::size_t kMaximumGroupLinks = 100'000;
+constexpr std::size_t kMaximumCatalogLinks = 100'000;
+constexpr std::size_t kMaximumCatalogPathBytes = 32ULL * 1024ULL * 1024ULL;
+constexpr std::size_t kMaximumLinkNameBytes = 16ULL * 1024ULL;
+constexpr std::size_t kMaximumMetadataStrings = 100'000;
+constexpr std::size_t kMaximumMetadataBytes = 64ULL * 1024ULL * 1024ULL;
+constexpr std::size_t kMaximumMetadataStringBytes = 1ULL * 1024ULL * 1024ULL;
+
+static_assert(
+    kMaximumMetadataStringBytes <=
+    std::numeric_limits<std::size_t>::max() / kMaximumMetadataStrings);
 
 class H5Handle {
 public:
@@ -96,13 +111,165 @@ void checked_status(herr_t value, std::string_view operation, std::string_view p
     }
 }
 
-[[nodiscard]] bool link_exists(hid_t location, const std::string& path) {
-    htri_t result = -1;
-    H5E_BEGIN_TRY {
-        result = H5Lexists(location, path.c_str(), H5P_DEFAULT);
+struct CatalogBudget {
+    std::size_t catalog_links = 0;
+    std::size_t catalog_path_bytes = 0;
+    std::size_t metadata_strings = 0;
+    std::size_t metadata_bytes = 0;
+
+    void consume_catalog_link(
+        std::string_view name,
+        std::string_view context) {
+        if (catalog_links == kMaximumCatalogLinks) {
+            fail("catalog link count exceeds safety limit", context);
+        }
+        ++catalog_links;
+        consume_catalog_path(name.size(), context);
     }
-    H5E_END_TRY;
-    return result > 0;
+
+    void consume_catalog_path(
+        std::size_t bytes,
+        std::string_view context) {
+        if (bytes > kMaximumCatalogPathBytes - catalog_path_bytes) {
+            fail("catalog path bytes exceed safety limit", context);
+        }
+        catalog_path_bytes += bytes;
+    }
+
+    void consume_metadata_strings(
+        std::size_t count,
+        std::string_view context) {
+        if (count > kMaximumMetadataStrings - metadata_strings) {
+            fail("metadata string count exceeds safety limit", context);
+        }
+        metadata_strings += count;
+    }
+
+    void consume_metadata_bytes(
+        std::size_t bytes,
+        std::string_view context) {
+        if (bytes > kMaximumMetadataBytes - metadata_bytes) {
+            fail("metadata string bytes exceed safety limit", context);
+        }
+        metadata_bytes += bytes;
+    }
+
+    [[nodiscard]] std::size_t remaining_metadata_bytes() const noexcept {
+        return kMaximumMetadataBytes - metadata_bytes;
+    }
+};
+
+struct VlenAllocationState {
+    std::unordered_set<void*> allocations;
+    std::size_t allocated_bytes = 0;
+    std::size_t maximum_bytes = 0;
+    bool limit_exceeded = false;
+};
+
+void* allocate_bounded_vlen(
+    const std::size_t bytes,
+    void* const opaque_state) noexcept {
+    auto& state = *static_cast<VlenAllocationState*>(opaque_state);
+    if (bytes > kMaximumMetadataStringBytes + 1 ||
+        bytes > state.maximum_bytes - state.allocated_bytes ||
+        state.allocations.size() == kMaximumMetadataStrings) {
+        state.limit_exceeded = true;
+        return nullptr;
+    }
+    void* const result = std::malloc(bytes);
+    if (result == nullptr) {
+        return nullptr;
+    }
+    try {
+        state.allocations.insert(result);
+    } catch (...) {
+        std::free(result);
+        return nullptr;
+    }
+    state.allocated_bytes += bytes;
+    return result;
+}
+
+void free_bounded_vlen(
+    void* const memory,
+    void* const opaque_state) noexcept {
+    if (memory == nullptr) {
+        return;
+    }
+    auto& state = *static_cast<VlenAllocationState*>(opaque_state);
+    if (state.allocations.erase(memory) != 0) {
+        std::free(memory);
+    }
+}
+
+void release_bounded_vlen_allocations(
+    VlenAllocationState& state) noexcept {
+    for (void* allocation : state.allocations) {
+        std::free(allocation);
+    }
+    state.allocations.clear();
+}
+
+[[nodiscard]] std::string hdf5_file_name(
+    const std::filesystem::path& path) {
+#ifdef _WIN32
+    const auto utf8 = path.u8string();
+    return std::string(
+        reinterpret_cast<const char*>(utf8.data()), utf8.size());
+#else
+    return path.string();
+#endif
+}
+
+void require_hard_link(
+    H5L_type_t type,
+    std::string_view path) {
+    if (type == H5L_TYPE_HARD) {
+        return;
+    }
+    if (type == H5L_TYPE_EXTERNAL) {
+        fail("refusing external link", path);
+    }
+    if (type >= H5L_TYPE_UD_MIN && type <= H5L_TYPE_UD_MAX) {
+        fail("refusing user-defined link", path);
+    }
+    if (type == H5L_TYPE_SOFT) {
+        fail("refusing symbolic link", path);
+    }
+    fail("refusing invalid link type", path);
+}
+
+[[nodiscard]] H5D_layout_t require_internal_storage_properties(
+    hid_t creation_properties,
+    std::string_view path) {
+    const int external_count = H5Pget_external_count(creation_properties);
+    if (external_count < 0) {
+        fail("getting external storage count", path);
+    }
+    if (external_count != 0) {
+        fail("refusing dataset with external raw storage", path);
+    }
+    const auto layout = H5Pget_layout(creation_properties);
+    if (layout == H5D_LAYOUT_ERROR) {
+        fail("getting storage layout", path);
+    }
+    if (layout == H5D_VIRTUAL) {
+        fail("refusing virtual dataset", path);
+    }
+    return layout;
+}
+
+void require_internal_dataset_storage(
+    hid_t dataset,
+    std::string_view path) {
+    H5Handle creation_properties(
+        checked_id(
+            H5Dget_create_plist(dataset),
+            "getting creation properties",
+            path),
+        H5Pclose);
+    static_cast<void>(
+        require_internal_storage_properties(creation_properties.get(), path));
 }
 
 [[nodiscard]] std::string normalize_hdf5_path(std::string_view input) {
@@ -129,6 +296,76 @@ void checked_status(herr_t value, std::string_view operation, std::string_view p
         result.pop_back();
     }
     return result;
+}
+
+[[nodiscard]] bool link_exists(hid_t location, const std::string& input_path) {
+    const auto path = normalize_hdf5_path(input_path);
+    if (path.empty()) {
+        return false;
+    }
+    if (path == "/") {
+        return true;
+    }
+
+    H5Handle group(
+        checked_id(H5Gopen2(location, "/", H5P_DEFAULT), "opening root group", path),
+        H5Gclose);
+    std::size_t cursor = 1;
+    std::string traversed;
+    while (cursor < path.size()) {
+        const auto separator = path.find('/', cursor);
+        const auto component = path.substr(
+            cursor,
+            separator == std::string::npos
+                ? std::string::npos
+                : separator - cursor);
+        traversed += "/" + component;
+
+        htri_t exists = -1;
+        H5E_BEGIN_TRY {
+            exists = H5Lexists(group.get(), component.c_str(), H5P_DEFAULT);
+        }
+        H5E_END_TRY;
+        if (exists < 0) {
+            fail("checking link existence", traversed);
+        }
+        if (exists == 0) {
+            return false;
+        }
+
+        H5L_info2_t link_info{};
+        checked_status(
+            H5Lget_info2(
+                group.get(), component.c_str(), &link_info, H5P_DEFAULT),
+            "getting link information",
+            traversed);
+        require_hard_link(link_info.type, traversed);
+
+        if (separator == std::string::npos) {
+            return true;
+        }
+        H5O_info2_t object_info{};
+        checked_status(
+            H5Oget_info_by_name3(
+                group.get(),
+                component.c_str(),
+                &object_info,
+                H5O_INFO_BASIC,
+                H5P_DEFAULT),
+            "getting path component information",
+            traversed);
+        if (object_info.type != H5O_TYPE_GROUP) {
+            fail("path component is not a group", traversed);
+        }
+        group = H5Handle(
+            checked_id(
+                H5Gopen2(group.get(), component.c_str(), H5P_DEFAULT),
+                "opening path component",
+                traversed),
+            H5Gclose);
+        cursor = separator + 1;
+    }
+    return true;
 }
 
 [[nodiscard]] std::string leaf_name(std::string_view path) {
@@ -181,7 +418,8 @@ void checked_status(herr_t value, std::string_view operation, std::string_view p
 [[nodiscard]] std::vector<std::string> read_string_dataset(
     hid_t file,
     const std::string& path,
-    bool required) {
+    bool required,
+    CatalogBudget& budget) {
     if (!link_exists(file, path)) {
         if (required) {
             fail("missing required string dataset", path);
@@ -192,6 +430,7 @@ void checked_status(herr_t value, std::string_view operation, std::string_view p
     H5Handle dataset(
         checked_id(H5Dopen2(file, path.c_str(), H5P_DEFAULT), "opening dataset", path),
         H5Dclose);
+    require_internal_dataset_storage(dataset.get(), path);
     H5Handle type(
         checked_id(H5Dget_type(dataset.get()), "getting datatype", path),
         H5Tclose);
@@ -206,43 +445,105 @@ void checked_status(herr_t value, std::string_view operation, std::string_view p
     if (points < 0) {
         fail("getting string count", path);
     }
-    constexpr hssize_t maximum_metadata_strings = 1'000'000;
-    if (points > maximum_metadata_strings) {
+    if (static_cast<hsize_t>(points) > kMaximumMetadataStrings) {
         fail("refusing implausibly large metadata string dataset", path);
     }
     const auto count = static_cast<std::size_t>(points);
     if (count == 0) {
         return {};
     }
+    budget.consume_metadata_strings(count, path);
 
     std::vector<std::string> result;
     result.reserve(count);
 
-    if (H5Tis_variable_str(type.get()) > 0) {
+    const auto variable_string = H5Tis_variable_str(type.get());
+    if (variable_string < 0) {
+        fail("checking whether string datatype is variable-length", path);
+    }
+    if (variable_string > 0) {
         std::vector<char*> values(count, nullptr);
+        VlenAllocationState allocation_state{
+            .maximum_bytes = budget.remaining_metadata_bytes(),
+        };
+        allocation_state.allocations.reserve(count);
+        H5Handle transfer_properties(
+            checked_id(
+                H5Pcreate(H5P_DATASET_XFER),
+                "creating variable-length transfer properties",
+                path),
+            H5Pclose);
         checked_status(
-            H5Dread(
+            H5Pset_vlen_mem_manager(
+                transfer_properties.get(),
+                allocate_bounded_vlen,
+                &allocation_state,
+                free_bounded_vlen,
+                &allocation_state),
+            "setting variable-length memory limit",
+            path);
+        herr_t read_status = -1;
+        H5E_BEGIN_TRY {
+            read_status = H5Dread(
                 dataset.get(),
                 type.get(),
                 H5S_ALL,
                 H5S_ALL,
-                H5P_DEFAULT,
-                values.data()),
-            "reading variable-length strings",
-            path);
-        for (char* value : values) {
-            result.emplace_back(trim_hdf5_string(value == nullptr ? std::string{} : value));
-            if (value != nullptr) {
-                H5free_memory(value);
+                transfer_properties.get(),
+                values.data());
+        }
+        H5E_END_TRY;
+        if (read_status < 0) {
+            release_bounded_vlen_allocations(allocation_state);
+            if (allocation_state.limit_exceeded) {
+                fail("variable-length string metadata exceeds safety limit", path);
             }
+            fail("reading variable-length strings", path);
+        }
+        try {
+            for (const char* value : values) {
+                if (value == nullptr) {
+                    result.emplace_back();
+                    continue;
+                }
+                const auto length = std::strlen(value);
+                if (length > kMaximumMetadataStringBytes) {
+                    fail("variable-length metadata string exceeds safety limit", path);
+                }
+                result.emplace_back(trim_hdf5_string(std::string(value, length)));
+            }
+        } catch (...) {
+            H5E_BEGIN_TRY {
+                static_cast<void>(H5Treclaim(
+                    type.get(),
+                    space.get(),
+                    transfer_properties.get(),
+                    values.data()));
+            }
+            H5E_END_TRY;
+            release_bounded_vlen_allocations(allocation_state);
+            throw;
+        }
+        budget.consume_metadata_bytes(
+            allocation_state.allocated_bytes, path);
+        const auto reclaim_status = H5Treclaim(
+                type.get(),
+                space.get(),
+                transfer_properties.get(),
+                values.data());
+        if (reclaim_status < 0) {
+            release_bounded_vlen_allocations(allocation_state);
+            fail("reclaiming variable-length strings", path);
         }
         return result;
     }
 
     const auto width = H5Tget_size(type.get());
-    if (width == 0 || (count > (16ULL * 1024ULL * 1024ULL) / width)) {
+    if (width == 0 || width > kMaximumMetadataStringBytes ||
+        count > kMaximumMetadataBytes / width) {
         fail("invalid or excessive fixed-string metadata size", path);
     }
+    budget.consume_metadata_bytes(count * width, path);
     std::vector<char> values(count * width);
     checked_status(
         H5Dread(
@@ -264,8 +565,9 @@ void checked_status(herr_t value, std::string_view operation, std::string_view p
 [[nodiscard]] std::string read_scalar_string(
     hid_t file,
     const std::string& path,
-    bool required) {
-    auto values = read_string_dataset(file, path, required);
+    bool required,
+    CatalogBudget& budget) {
+    auto values = read_string_dataset(file, path, required, budget);
     if (values.empty()) {
         return {};
     }
@@ -284,6 +586,7 @@ void checked_status(herr_t value, std::string_view operation, std::string_view p
     H5Handle dataset(
         checked_id(H5Dopen2(file, path.c_str(), H5P_DEFAULT), "opening dataset", path),
         H5Dclose);
+    require_internal_dataset_storage(dataset.get(), path);
     H5Handle space(
         checked_id(H5Dget_space(dataset.get()), "getting dataspace", path),
         H5Sclose);
@@ -313,6 +616,7 @@ void checked_status(herr_t value, std::string_view operation, std::string_view p
     H5Handle dataset(
         checked_id(H5Dopen2(file, path.c_str(), H5P_DEFAULT), "opening dataset", path),
         H5Dclose);
+    require_internal_dataset_storage(dataset.get(), path);
     H5Handle space(
         checked_id(H5Dget_space(dataset.get()), "getting dataspace", path),
         H5Sclose);
@@ -366,7 +670,8 @@ void checked_status(herr_t value, std::string_view operation, std::string_view p
 [[nodiscard]] std::string read_string_attribute_if_present(
     hid_t object,
     const std::string& object_path,
-    const char* attribute_name) {
+    const char* attribute_name,
+    CatalogBudget& budget) {
     const auto present = H5Aexists(object, attribute_name);
     if (present < 0) {
         fail("checking attribute", object_path + "@" + attribute_name);
@@ -392,23 +697,24 @@ void checked_status(herr_t value, std::string_view operation, std::string_view p
         return {};
     }
 
-    if (H5Tis_variable_str(type.get()) > 0) {
-        char* value = nullptr;
-        checked_status(
-            H5Aread(attribute.get(), type.get(), &value),
-            "reading string attribute",
-            context);
-        std::string result = trim_hdf5_string(value == nullptr ? std::string{} : value);
-        if (value != nullptr) {
-            H5free_memory(value);
-        }
-        return result;
+    budget.consume_metadata_strings(1, context);
+    const auto variable_string = H5Tis_variable_str(type.get());
+    if (variable_string < 0) {
+        fail("checking whether string attribute is variable-length", context);
+    }
+    if (variable_string > 0) {
+        // H5Aread has no transfer property list and therefore no bounded VLEN
+        // allocator hook. H5Aget_storage_size reports only the 16-byte heap
+        // identifier for scalar VLEN strings in HDF5 2.1, not the payload size.
+        // Reject explicitly rather than allocating attacker-controlled data.
+        fail("refusing variable-length string attribute", context);
     }
 
     const auto width = H5Tget_size(type.get());
-    if (width == 0 || width > 16ULL * 1024ULL * 1024ULL) {
+    if (width == 0 || width > kMaximumMetadataStringBytes) {
         fail("invalid fixed string attribute size", context);
     }
+    budget.consume_metadata_bytes(width, context);
     std::string value(width, '\0');
     checked_status(
         H5Aread(attribute.get(), type.get(), value.data()),
@@ -496,7 +802,10 @@ void checked_status(herr_t value, std::string_view operation, std::string_view p
             fail("getting compound member name", path);
         }
         members[index].name = raw_name;
-        H5free_memory(raw_name);
+        checked_status(
+            H5free_memory(raw_name),
+            "reclaiming compound member name",
+            path);
         members[index].offset = H5Tget_member_offset(type, index);
         H5Handle member_type(
             checked_id(H5Tget_member_type(type, index), "getting compound member datatype", path),
@@ -864,7 +1173,8 @@ template <typename T>
 
 [[nodiscard]] std::vector<std::string> group_children(
     hid_t file,
-    const std::string& group_path) {
+    const std::string& group_path,
+    CatalogBudget& budget) {
     H5Handle group(
         checked_id(H5Gopen2(file, group_path.c_str(), H5P_DEFAULT), "opening group", group_path),
         H5Gclose);
@@ -872,7 +1182,7 @@ template <typename T>
     checked_status(H5Gget_info(group.get(), &info), "getting group information", group_path);
 
     std::vector<std::string> result;
-    if (info.nlinks > 1'000'000) {
+    if (info.nlinks > kMaximumGroupLinks) {
         fail("refusing implausibly large group", group_path);
     }
     result.reserve(static_cast<std::size_t>(info.nlinks));
@@ -889,6 +1199,9 @@ template <typename T>
         if (name_size < 0) {
             fail("getting child link name size", group_path);
         }
+        if (static_cast<hsize_t>(name_size) > kMaximumLinkNameBytes) {
+            fail("child link name exceeds safety limit", group_path);
+        }
         std::string name(static_cast<std::size_t>(name_size) + 1, '\0');
         const auto copied = H5Lget_name_by_idx(
             group.get(),
@@ -902,7 +1215,20 @@ template <typename T>
         if (copied < 0) {
             fail("getting child link name", group_path);
         }
+        if (copied > name_size ||
+            static_cast<hsize_t>(copied) > kMaximumLinkNameBytes) {
+            fail("child link name changed while reading", group_path);
+        }
         name.resize(static_cast<std::size_t>(copied));
+        const auto child_path = group_path + "/" + name;
+        H5L_info2_t link_info{};
+        checked_status(
+            H5Lget_info2(
+                group.get(), name.c_str(), &link_info, H5P_DEFAULT),
+            "getting child link information",
+            child_path);
+        require_hard_link(link_info.type, child_path);
+        budget.consume_catalog_link(name, child_path);
         result.push_back(std::move(name));
     }
     return result;
@@ -912,6 +1238,7 @@ void collect_dataset_paths(
     hid_t file,
     const std::string& group_path,
     std::vector<std::string>& output,
+    CatalogBudget& budget,
     unsigned depth = 0) {
     if (depth > 64) {
         fail("group nesting exceeds safety limit", group_path);
@@ -919,7 +1246,7 @@ void collect_dataset_paths(
     H5Handle group(
         checked_id(H5Gopen2(file, group_path.c_str(), H5P_DEFAULT), "opening group", group_path),
         H5Gclose);
-    for (const auto& name : group_children(file, group_path)) {
+    for (const auto& name : group_children(file, group_path, budget)) {
         H5O_info2_t object_info{};
         checked_status(
             H5Oget_info_by_name3(
@@ -931,10 +1258,11 @@ void collect_dataset_paths(
             "getting object information",
             group_path + "/" + name);
         const auto path = group_path + "/" + name;
+        budget.consume_catalog_path(path.size(), path);
         if (object_info.type == H5O_TYPE_DATASET) {
             output.push_back(path);
         } else if (object_info.type == H5O_TYPE_GROUP) {
-            collect_dataset_paths(file, path, output, depth + 1);
+            collect_dataset_paths(file, path, output, budget, depth + 1);
         }
     }
 }
@@ -957,6 +1285,7 @@ void collect_dataset_paths(
     H5Handle dataset(
         checked_id(H5Dopen2(file, path.c_str(), H5P_DEFAULT), "opening axis dataset", path),
         H5Dclose);
+    require_internal_dataset_storage(dataset.get(), path);
     H5Handle file_space(
         checked_id(H5Dget_space(dataset.get()), "getting axis dataspace", path),
         H5Sclose);
@@ -998,6 +1327,7 @@ void collect_dataset_paths(
             "opening coordinate axis",
             axis_path),
         H5Dclose);
+    require_internal_dataset_storage(dataset.get(), axis_path);
     H5Handle space(
         checked_id(H5Dget_space(dataset.get()), "getting coordinate dataspace", axis_path),
         H5Sclose);
@@ -1086,6 +1416,8 @@ void collect_dataset_paths(
                     "opening projection dataset",
                     *projection_path),
                 H5Dclose);
+            require_internal_dataset_storage(
+                projection.get(), *projection_path);
             result.epsg =
                 read_u32_attribute_if_present(projection.get(), *projection_path, "epsg_code");
         }
@@ -1166,7 +1498,8 @@ struct LayerClassification {
     const std::string& path,
     ProductType product_type,
     const std::vector<FrequencyCatalog>& frequencies,
-    const Hdf5OpenOptions& options) {
+    const Hdf5OpenOptions& options,
+    CatalogBudget& budget) {
     H5Handle dataset(
         checked_id(H5Dopen2(file, path.c_str(), H5P_DEFAULT), "opening dataset", path),
         H5Dclose);
@@ -1197,10 +1530,8 @@ struct LayerClassification {
     result.data_type.file_representation_is_native =
         file_representation_is_native(
             type.get(), result.data_type, path);
-    const auto hdf5_layout = H5Pget_layout(creation_properties.get());
-    if (hdf5_layout == H5D_LAYOUT_ERROR) {
-        fail("getting storage layout", path);
-    }
+    const auto hdf5_layout =
+        require_internal_storage_properties(creation_properties.get(), path);
     result.storage_layout = storage_layout(hdf5_layout);
     if (hdf5_layout == H5D_CHUNKED) {
         std::array<hsize_t, 2> chunks{};
@@ -1217,12 +1548,16 @@ struct LayerClassification {
         creation_fill_value(creation_properties.get(), result.data_type, path);
     result.fill_value_attribute =
         fill_value_attribute(dataset.get(), result.data_type, path);
-    result.units = read_string_attribute_if_present(dataset.get(), path, "units");
-    result.long_name = read_string_attribute_if_present(dataset.get(), path, "long_name");
+    result.units =
+        read_string_attribute_if_present(dataset.get(), path, "units", budget);
+    result.long_name = read_string_attribute_if_present(
+        dataset.get(), path, "long_name", budget);
     result.description =
-        read_string_attribute_if_present(dataset.get(), path, "description");
+        read_string_attribute_if_present(
+            dataset.get(), path, "description", budget);
     result.grid_mapping =
-        read_string_attribute_if_present(dataset.get(), path, "grid_mapping");
+        read_string_attribute_if_present(
+            dataset.get(), path, "grid_mapping", budget);
 
     const auto classification =
         classify_layer(product_type, frequencies, path, result.data_type);
@@ -1523,7 +1858,11 @@ public:
         if (path_error) {
             file_path_ = std::move(file_path).lexically_normal();
         }
-        source_file_ = file_path_.string();
+        source_file_ = hdf5_file_name(file_path_);
+        checked_status(
+            H5PLset_loading_state(0),
+            "disabling dynamic plugin loading",
+            source_file_);
         file_ = H5Handle(
             checked_id(
                 H5Fopen(source_file_.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT),
@@ -1532,9 +1871,10 @@ public:
             H5Fclose);
 
         try {
-            parse_identification();
-            parse_frequencies();
-            parse_datasets();
+            CatalogBudget budget;
+            parse_identification(budget);
+            parse_frequencies(budget);
+            parse_datasets(budget);
         } catch (...) {
             file_.reset();
             throw;
@@ -1703,6 +2043,8 @@ public:
                     "opening dataset for read",
                     descriptor->path),
                 H5Dclose);
+            require_internal_dataset_storage(
+                dataset.get(), descriptor->path);
             H5Handle file_type(
                 checked_id(
                     H5Dget_type(dataset.get()),
@@ -1850,7 +2192,7 @@ public:
     mutable std::list<CachedDataset> dataset_cache_;
 
 private:
-    void parse_identification() {
+    void parse_identification(CatalogBudget& budget) {
         std::string instrument;
         if (link_exists(file_.get(), "/science/LSAR/identification")) {
             instrument = "LSAR";
@@ -1861,8 +2203,11 @@ private:
         }
 
         const auto identification_path = "/science/" + instrument + "/identification";
-        const auto type_text =
-            read_scalar_string(file_.get(), identification_path + "/productType", true);
+        const auto type_text = read_scalar_string(
+            file_.get(),
+            identification_path + "/productType",
+            true,
+            budget);
         const auto normalized_type = uppercase_ascii(type_text);
         ProductType product_type;
         if (normalized_type == "GSLC") {
@@ -1883,26 +2228,33 @@ private:
         identification_ = Identification{
             .product_type = product_type,
             .product_type_text = type_text,
-            .granule_id =
-                read_scalar_string(file_.get(), identification_path + "/granuleId", true),
-            .product_version =
-                read_scalar_string(file_.get(), identification_path + "/productVersion", true),
+            .granule_id = read_scalar_string(
+                file_.get(),
+                identification_path + "/granuleId",
+                true,
+                budget),
+            .product_version = read_scalar_string(
+                file_.get(),
+                identification_path + "/productVersion",
+                true,
+                budget),
             .product_specification_version = read_scalar_string(
                 file_.get(),
                 identification_path + "/productSpecificationVersion",
-                false),
+                false,
+                budget),
             .instrument_group = instrument,
             .identification_group_path = identification_path,
             .product_group_path = product_path,
         };
     }
 
-    void parse_frequencies() {
+    void parse_frequencies(CatalogBudget& budget) {
         const auto grid_path = identification_.product_group_path + "/grids";
         if (!link_exists(file_.get(), grid_path)) {
             fail("missing geocoded grids group", grid_path);
         }
-        for (const auto& child : group_children(file_.get(), grid_path)) {
+        for (const auto& child : group_children(file_.get(), grid_path, budget)) {
             if (child.size() <= std::string_view("frequency").size() ||
                 child.rfind("frequency", 0) != 0) {
                 continue;
@@ -1928,11 +2280,13 @@ private:
             frequency.polarizations = read_string_dataset(
                 file_.get(),
                 frequency_path + "/listOfPolarizations",
-                false);
+                false,
+                budget);
             frequency.covariance_terms = read_string_dataset(
                 file_.get(),
                 frequency_path + "/listOfCovarianceTerms",
-                false);
+                false,
+                budget);
             frequency.grid = inspect_grid(file_.get(), grid_path, frequency_path);
             frequencies_.push_back(std::move(frequency));
         }
@@ -1948,14 +2302,19 @@ private:
         }
     }
 
-    void parse_datasets() {
+    void parse_datasets(CatalogBudget& budget) {
         std::vector<std::string> paths;
-        collect_dataset_paths(file_.get(), identification_.product_group_path, paths);
+        collect_dataset_paths(
+            file_.get(),
+            identification_.product_group_path,
+            paths,
+            budget);
         std::sort(paths.begin(), paths.end());
         for (const auto& path : paths) {
             H5Handle dataset(
                 checked_id(H5Dopen2(file_.get(), path.c_str(), H5P_DEFAULT), "opening dataset", path),
                 H5Dclose);
+            require_internal_dataset_storage(dataset.get(), path);
             H5Handle space(
                 checked_id(H5Dget_space(dataset.get()), "getting dataspace", path),
                 H5Sclose);
@@ -1967,7 +2326,8 @@ private:
                 path,
                 identification_.product_type,
                 frequencies_,
-                options_);
+                options_,
+                budget);
             const auto index = datasets_.size();
             dataset_index_.emplace(descriptor.path, index);
             datasets_.push_back(std::move(descriptor));
@@ -1989,8 +2349,6 @@ Hdf5Product::Hdf5Product(
     : impl_(std::make_unique<Impl>(std::move(file_path), options)) {}
 
 Hdf5Product::~Hdf5Product() = default;
-Hdf5Product::Hdf5Product(Hdf5Product&&) noexcept = default;
-Hdf5Product& Hdf5Product::operator=(Hdf5Product&&) noexcept = default;
 
 const std::filesystem::path& Hdf5Product::file_path() const noexcept {
     return impl_->file_path_;

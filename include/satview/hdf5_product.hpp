@@ -207,8 +207,8 @@ public:
         Hdf5OpenOptions options = {});
     ~Hdf5Product();
 
-    Hdf5Product(Hdf5Product&&) noexcept;
-    Hdf5Product& operator=(Hdf5Product&&) noexcept;
+    Hdf5Product(Hdf5Product&&) = delete;
+    Hdf5Product& operator=(Hdf5Product&&) = delete;
     Hdf5Product(const Hdf5Product&) = delete;
     Hdf5Product& operator=(const Hdf5Product&) = delete;
 

@@ -202,8 +202,8 @@ public:
 
     ~CudaStream() noexcept {
         if (stream_ != nullptr) {
-            // The stream is declared after device allocations, so this drain
-            // completes before those allocations are released during unwind.
+            // Drain queued work before destruction so it no longer references
+            // caller-owned buffers during unwind.
             static_cast<void>(cudaStreamSynchronize(stream_));
             static_cast<void>(cudaStreamDestroy(stream_));
         }

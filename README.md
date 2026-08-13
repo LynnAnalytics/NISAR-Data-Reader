@@ -13,6 +13,8 @@ An open-source exploratory visualizer for (NASA-ISRO Synthetic Aperture Radar) N
 - Guarded screen-space LOD pages for smooth navigation across large products.
 - GSLC amplitude, power, power dB, phase, real, and imaginary modes.
 - GCOV covariance linear/dB and complex cross-term magnitude/phase modes.
+- Full-polarimetric GCOV Pauli RGB decomposition.
+- Co-registered layer/band split, swipe, difference, and power-ratio tools.
 - Boxcar and adaptive Lee speckle filters with 3x3, 5x5, and 7x7 windows.
 - Live finite/invalid counts, extrema, percentiles, and a log-count histogram.
 - Grayscale, Turbo, cyclic phase, cmweather, and D3 colormaps.
@@ -111,6 +113,31 @@ Start with a centered 4x4 native source footprint:
 .\build\preset-release\viewer\Release\sat-viewer.exe --zoom 4 "E:\path\to\NISAR_product.h5"
 ```
 
+Choose **Pauli RGB decomposition** or a layer comparison from the in-app
+**Analysis tool**. Pauli is enabled only for a full-polarimetric GCOV frequency
+with aligned `HHHH`, `HVHV`, `VVVV`, and complex `HHVV` covariance terms.
+Comparison modes operate on two different science layers from the same exact
+frequency grid; split and swipe show both transformed layers, difference is
+`A - B`, and ratio is `10*log10(A/B)` in linear power.
+
+Start directly in an analysis mode:
+
+```powershell
+# Full-pol GCOV Pauli RGB
+.\build\preset-release\viewer\Release\sat-viewer.exe `
+  --analysis pauli --pauli-frequency A "E:\path\to\NISAR_GCOV.h5"
+
+# Co-registered layer swipe; dataset paths are exact HDF5 paths
+.\build\preset-release\viewer\Release\sat-viewer.exe `
+  --analysis swipe --compare-divider 0.5 `
+  --layer "/science/LSAR/GCOV/grids/frequencyA/HHHH" `
+  --compare-layer "/science/LSAR/GCOV/grids/frequencyA/HVHV" `
+  "E:\path\to\NISAR_GCOV.h5"
+```
+
+Derived analysis pages use bounded in-memory streaming and exact native-grid
+samples. They do not create a persistent cache or intermediate raster.
+
 ## Controls
 
 | Input | Action |
@@ -130,6 +157,11 @@ Start with a centered 4x4 native source footprint:
 --zoom 1|2|4
 --fit-scene
 --rotation DEGREES
+--analysis single|pauli|split|swipe|difference|ratio
+--layer HDF5_PATH
+--compare-layer HDF5_PATH
+--pauli-frequency A|B
+--compare-divider 0..1
 --backend auto|cuda|cpu|hip|sycl
 --clean-view
 --speckle none|boxcar|lee
@@ -173,8 +205,24 @@ $ctest = "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\I
 
 The suite covers navigation geometry, LOD planning, native/LOD selection,
 science and mask sampling, CPU/CUDA transforms, speckle filters, distributions,
-colormaps, cancellation, and publication behavior. Real-product integration
-tests discover fixtures from `Test Data` or `SATVIEW_TEST_DATA_DIR`.
+colormaps, cancellation, and publication behavior. The default suite is
+hermetic: it uses synthetic fixtures and does not require `Test Data`.
+
+Optional test modes are selected when configuring, then built and run normally:
+
+```powershell
+# Exact machine-local products from Test Data or SATVIEW_TEST_DATA_DIR
+cmake --preset release -DSATVIEW_ENABLE_REAL_DATA_TESTS=ON
+
+# Register the standalone GPU microbenchmark
+cmake --preset release -DSATVIEW_ENABLE_BENCHMARK_TESTS=ON
+
+# Certification: fail instead of skip when a built accelerator is unavailable
+cmake --preset release -DSATVIEW_REQUIRE_ACCELERATOR_TESTS=ON
+```
+
+Without strict certification, unavailable accelerator tests are reported as
+skipped rather than passed.
 
 ## Technical documentation
 

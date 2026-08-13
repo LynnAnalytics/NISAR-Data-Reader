@@ -154,6 +154,7 @@ public:
                 requested_.reset();
             }
             if (progress_.request_serial != request_serial) {
+                progress_.request_serial = request_serial;
                 progress_.active = false;
             }
             if (completed_.has_value() &&
@@ -236,6 +237,7 @@ private:
         }
         std::lock_guard lock(mutex_);
         if (!stopped_ &&
+            !superseded(request.request_serial) &&
             progress_.request_serial == request.request_serial) {
             progress_.overview_progress = progress;
             progress_.active = true;

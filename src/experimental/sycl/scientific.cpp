@@ -33,19 +33,8 @@ void validate_request(
       (!request.validity.empty() && request.validity.size() != count)) {
     throw std::invalid_argument("SYCL page buffers do not match");
   }
-  if (request.filter_enabled) {
-    if ((request.speckle.filter != cpu::SpeckleFilter::boxcar &&
-         request.speckle.filter != cpu::SpeckleFilter::lee) ||
-        (request.speckle.window_size != 3 &&
-         request.speckle.window_size != 5 &&
-         request.speckle.window_size != 7) ||
-        !std::isfinite(request.speckle.power_epsilon) ||
-        request.speckle.power_epsilon <= 0.0F ||
-        (request.speckle.filter == cpu::SpeckleFilter::lee &&
-         (!std::isfinite(request.speckle.equivalent_number_of_looks) ||
-          request.speckle.equivalent_number_of_looks <= 0.0F))) {
-      throw std::invalid_argument("SYCL speckle options are invalid");
-    }
+  if (!valid_filter_configuration(request)) {
+    throw std::invalid_argument("SYCL speckle options are invalid");
   }
 }
 

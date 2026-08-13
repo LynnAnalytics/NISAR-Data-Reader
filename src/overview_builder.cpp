@@ -314,8 +314,8 @@ void append_dataset(
     if (mask != nullptr) {
         append_dataset(writer, *mask);
     }
-    // Keep the legacy whole-scene metadata byte-for-byte compatible. Only a
-    // true regional window appends the versioned extent discriminator.
+    // Default and explicit whole-scene requests share one canonical identity.
+    // Only a true regional window needs the extent discriminator.
     if (layout.source_origin != std::array<std::uint64_t, 2>{0, 0} ||
         layout.source_dimensions != science.dimensions) {
         writer.string("regional-source-window-v1");

@@ -15,6 +15,9 @@ enum class SlotState : std::uint8_t {
   InFlight,
 };
 
+// A fixed-size ring of pageable host buffers. All slot and queue storage is
+// allocated during construction, so lifecycle transitions and lease rollback
+// do not allocate.
 class PageableRing final {
  private:
   struct Impl;

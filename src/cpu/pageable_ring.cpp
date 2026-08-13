@@ -2,7 +2,6 @@
 
 #include <cassert>
 #include <condition_variable>
-#include <deque>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -13,6 +12,41 @@ namespace satview::cpu {
 namespace {
 
 constexpr std::size_t kInvalidSlot = static_cast<std::size_t>(-1);
+
+class IndexQueue final {
+ public:
+  explicit IndexQueue(const std::size_t capacity) : storage_(capacity) {}
+
+  [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+
+  void push(const std::size_t value) noexcept {
+    assert(size_ < storage_.size());
+    if (size_ >= storage_.size()) {
+      std::terminate();
+    }
+
+    const std::size_t tail = (head_ + size_) % storage_.size();
+    storage_[tail] = value;
+    ++size_;
+  }
+
+  [[nodiscard]] std::size_t pop() noexcept {
+    assert(size_ != 0);
+    if (size_ == 0) {
+      std::terminate();
+    }
+
+    const std::size_t value = storage_[head_];
+    head_ = (head_ + 1) % storage_.size();
+    --size_;
+    return value;
+  }
+
+ private:
+  std::vector<std::size_t> storage_;
+  std::size_t head_ = 0;
+  std::size_t size_ = 0;
+};
 
 PageableRing::Options validate_options(PageableRing::Options options) {
   if (options.slot_count == 0 || options.bytes_per_slot == 0) {
@@ -37,16 +71,18 @@ struct PageableRing::Impl final {
   };
 
   explicit Impl(const Options requested)
-      : options(validate_options(requested)), slots(options.slot_count) {
+      : options(validate_options(requested)),
+        slots(options.slot_count),
+        free_slots(options.slot_count),
+        ready_slots(options.slot_count) {
     for (std::size_t index = 0; index < slots.size(); ++index) {
       slots[index].storage.resize(options.bytes_per_slot);
-      free_slots.push_back(index);
+      free_slots.push(index);
     }
   }
 
   [[nodiscard]] SlotLease take_free(const std::shared_ptr<Impl>& self) {
-    const std::size_t index = free_slots.front();
-    free_slots.pop_front();
+    const std::size_t index = free_slots.pop();
     Slot& slot = slots[index];
     assert(slot.state == SlotState::Free && !slot.leased);
     slot.state = SlotState::Filling;
@@ -56,8 +92,7 @@ struct PageableRing::Impl final {
   }
 
   [[nodiscard]] SlotLease take_ready(const std::shared_ptr<Impl>& self) {
-    const std::size_t index = ready_slots.front();
-    ready_slots.pop_front();
+    const std::size_t index = ready_slots.pop();
     Slot& slot = slots[index];
     assert(slot.state == SlotState::Ready && !slot.leased);
     slot.leased = true;
@@ -76,7 +111,7 @@ struct PageableRing::Impl final {
     slot.payload_size = bytes_used;
     slot.leased = false;
     slot.state = SlotState::Ready;
-    ready_slots.push_back(index);
+    ready_slots.push(index);
     changed.notify_all();
   }
 
@@ -89,7 +124,7 @@ struct PageableRing::Impl final {
     slot.payload_size = 0;
     slot.leased = false;
     slot.state = SlotState::Free;
-    free_slots.push_back(index);
+    free_slots.push(index);
     changed.notify_all();
   }
 
@@ -103,13 +138,13 @@ struct PageableRing::Impl final {
       slot.payload_size = 0;
       slot.leased = false;
       slot.state = SlotState::Free;
-      free_slots.push_back(index);
+      free_slots.push(index);
     } else if (role == LeaseRole::Ready) {
       if (slot.state != SlotState::Ready || !slot.leased) {
         std::terminate();
       }
       slot.leased = false;
-      ready_slots.push_back(index);
+      ready_slots.push(index);
     } else {
       std::terminate();
     }
@@ -118,8 +153,8 @@ struct PageableRing::Impl final {
 
   const Options options;
   std::vector<Slot> slots;
-  std::deque<std::size_t> free_slots;
-  std::deque<std::size_t> ready_slots;
+  IndexQueue free_slots;
+  IndexQueue ready_slots;
   mutable std::mutex mutex;
   std::condition_variable_any changed;
 };

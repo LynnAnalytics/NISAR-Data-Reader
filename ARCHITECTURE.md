@@ -39,6 +39,16 @@ identification, frequency groups, grid axes, EPSG metadata, science layers,
 auxiliary layers, physical shapes, datatypes, storage layout, chunk dimensions,
 fill metadata, and filter order.
 
+Untrusted containers are kept self-contained: catalog traversal rejects soft,
+external, and user-defined links, virtual datasets, and external raw storage.
+Dynamic HDF5 plugin loading is disabled before the file opens. Aggregate link,
+path, and metadata-string budgets bound discovery work; variable-length dataset
+strings use a bounded allocator, while optional variable-length annotation
+attributes are rejected explicitly because the attribute API has no bounded
+allocator hook. HDF5 exposes plugin loading only as a process-wide setting, so
+opening a product intentionally leaves dynamic plugins disabled for the rest of
+these standalone tools' process lifetime.
+
 Complex HDF5 compounds are exposed to callers as tightly packed,
 native-endian `{float real, float imaginary}` pairs. A `ReadPlan` expands the
 requested window to complete source chunks and clips it at dataset edges.
@@ -142,19 +152,19 @@ For a selected native mosaic:
    co-sampled mask mosaic. There is no device-to-device mask-crop pass.
 6. These private input writes do not touch the Vulkan-owned output, so all
    chunk H2Ds are queued before any wait for previous Vulkan consumption.
-7. A three-slot event/read pump drains ready completions and reclaims slots
-   without tying a 16-chunk load to the presentation rate.
+7. A bounded one-to-three-slot event/read pump drains ready completions and
+   reclaims slots without tying a 16-chunk load to the presentation rate.
 8. After the final chunk, one mask-aware CUDA kernel transforms the complete
-   mosaic. With **None**, it writes the Vulkan-exported R32F buffer directly.
+   mosaic. With **None**, it writes the raw Vulkan-exported 32-bit buffer directly.
    With speckle enabled, it writes one persistent float scratch page instead.
 9. The selected 3x3, 5x5, or 7x7 Boxcar/Lee kernel reads that scratch page and
-   writes the final Vulkan-exported R32F field. No filter kernel launches for
+   writes the final Vulkan-exported 32-bit field. No filter kernel launches for
    **None**.
 10. One asynchronous distribution pass scans the final field, then copies only
     its fixed approximately 2 KiB summary through pinned memory. There is no
     full scalar-output readback.
 11. CUDA signals an external timeline value. Vulkan waits at the transfer stage,
-    then copies the complete buffer into the inactive R32F image.
+    then copies the complete buffer into the inactive R32_UINT image.
 12. The same Vulkan submission signals the next timeline value after consuming
     the buffer; the next CUDA output write waits for that value.
 13. The completed inactive image becomes the new resident source. If an older
@@ -220,11 +230,13 @@ low/high/gamma edits therefore do not rescan either HDF5 or CUDA data.
 
 ## Pinned-ring lifetime
 
-The viewer constructs three fixed-capacity `cudaHostAlloc` slots sized for the
-largest single science chunk plus its worst-case aligned sibling-mask read.
-Capacity does not grow to 4x4: the larger working set exists only in persistent
-GPU allocations. Alignment bounds account for partial mask chunks before and
-after a request and are checked against the 2 GiB safety cap.
+The viewer constructs one to three fixed-capacity `cudaHostAlloc` slots sized
+for the largest single science chunk plus its worst-case aligned sibling-mask
+read. Slot count is reduced as necessary so the complete read ring stays at or
+below 512 MiB; a single packed chunk above that bound is rejected. Capacity
+does not grow to 4x4: the larger working set exists only in persistent GPU
+allocations. Alignment bounds account for partial mask chunks before and after
+a request.
 
 Each slot has a pre-created CUDA event:
 
@@ -264,7 +276,7 @@ optional speckle kernel writes scratch -> shared output
 CUDA distribution summarizes the final shared field to a fixed pinned result
 CUDA signals odd value N (CUDA ready)
 Vulkan waits for N at TRANSFER
-Vulkan copies buffer -> inactive R32F image
+Vulkan copies buffer -> inactive R32_UINT image
 Vulkan signals N + 1 (Vulkan consumed)
 next CUDA write waits for N + 1
 ```
@@ -307,9 +319,53 @@ dense native semantics, while an LOD page spans sparse samples separated by its
 labeled stride. Filter options participate in exact render identity, and the
 resident distribution always scans the post-filter field.
 
+## Polarimetric decomposition and layer comparison
+
+Derived analysis uses a serial, latest-request-wins worker separate from the
+single-layer reader. Its aligned reader streams up to four science rasters on
+one exact source lattice, deduplicates a shared sibling mask, and visits a
+block only after all of its members are complete. Every member retains its own
+bounded HDF5 `ReadPlan`; planning rejects incompatible grids, stale source
+metadata, arithmetic overflow, or output/scratch budgets before publication.
+Cancellation returns no partial page. The result is held only in bounded
+worker/renderer memory and is never written to a persistent cache.
+Canonical page identity excludes only the scheduling serial, so unchanged
+guarded windows reuse active, prepared, or resident composite data. Switching
+between split and swipe reuses the same packed pair and changes only draw state.
+
+Pauli RGB is resolved per frequency and is available only when one GCOV grid
+contains readable, identically aligned float32 `HHHH`, `HVHV`, and `VVVV`
+diagonal terms plus complex64 `HHVV`. For reciprocal covariance input the
+linear channel powers are:
+
+```text
+R (double bounce) = 0.5 * (HHHH + VVVV - 2*Re(HHVV))
+G (cross-pol)     = 2 * HVHV
+B (surface)       = 0.5 * (HHHH + VVVV + 2*Re(HHVV))
+```
+
+Non-finite terms, negative diagonal powers, or an invalid shared mask make the
+output invalid. Negative derived channel power is retained by the scientific
+calculation but clipped to zero only for RGB display conversion. The displayed
+channels are converted to dB and packed as three 10-bit values over
+`[-100, +50] dB`, with a two-bit validity tag, in one R32_UINT transport word.
+
+Layer comparison currently requires two different science rasters on the same
+frequency with identical non-empty dimensions, grid mapping, usable coordinate
+metadata, and compatible units. Thus split, swipe, `A - B`, and power-ratio
+views are exact-grid comparisons only; no resampling or reprojection is hidden
+in the operation. Split and swipe pack the independently valid transformed
+values as two range-preserving bfloat16 values in one R32_UINT transport word.
+Difference remains a full float32 scalar. Ratio is computed from non-negative linear power and shown
+as `10*log10(A/B)`; valid zero numerators use the transform epsilon floor
+(`-200 dB` at the current `1e-20` epsilon), while zero/near-zero denominators
+are invalid. Speckle filtering is disabled for these derived pages.
+
 ## Rendering and display controls
 
-The scientific result is a scalar R32F field. The fragment shader:
+The renderer always receives an R32_UINT image. Scalar pages retain their exact
+float32 bits and are decoded with `uintBitsToFloat`; composite pages use one of
+the two packed display transports above. The fragment shader:
 
 - maps the axis-aligned draw rectangle through the inverse camera rotation into
   a resident native mosaic or LOD page, discarding fragments outside the
@@ -323,6 +379,13 @@ The scientific result is a scalar R32F field. The fragment shader:
 - rounds to one of 256 samples in a persistent 256-by-20 RGBA8 UNORM atlas;
 - selects a palette row with an exact nearest `texelFetch`;
 - discards NaN/Inf and unused image texels rather than sampling stale data.
+
+Packed Pauli and split/swipe views force authoritative nearest-texel sampling;
+the latter maps both panels to the same complete source window, with swipe
+using a screen-space divider. Scalar difference and ratio retain the ordinary
+float distribution, palette, and range controls. Packing is a display/storage
+transport: it is not used for the float32 Pauli arithmetic, difference, or
+ratio calculations.
 
 Smooth is display interpolation over exact sparse stored samples; it does not
 change the cache payload, perform a radiometric aggregate, or alter the native

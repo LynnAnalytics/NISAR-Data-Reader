@@ -22,6 +22,8 @@
 #include <utility>
 #include <vector>
 
+int run_overview_worker_tests(const satview::Hdf5Product& product);
+
 namespace {
 
 void expect(
@@ -465,6 +467,7 @@ void run_synthetic_regional_tests(int& failures) {
     TemporaryDirectory temporary;
     const satview::Hdf5Product product(
         make_synthetic_product(temporary.path()));
+    failures += run_overview_worker_tests(product);
     constexpr std::string_view science_path =
         "/science/LSAR/GCOV/grids/frequencyA/HHHH";
     const auto* science_descriptor = product.find_dataset(science_path);
@@ -689,11 +692,16 @@ void run_synthetic_regional_tests(int& failures) {
 
 }  // namespace
 
+int run_synthetic_overview_tests() {
+    int failures = 0;
+    run_synthetic_regional_tests(failures);
+    return failures;
+}
+
 int run_overview_tests(const satview::Hdf5Product& product) {
     using namespace satview::overview;
 
     int failures = 0;
-    run_synthetic_regional_tests(failures);
     OverviewRequest request{
         .science_dataset_path =
             "/science/LSAR/GCOV/grids/frequencyB/HHHH",

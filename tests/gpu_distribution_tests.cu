@@ -11,6 +11,10 @@
 
 namespace {
 
+#ifndef SATVIEW_REQUIRE_ACCELERATOR_TESTS
+constexpr int kTestSkipped = 77;
+#endif
+
 void expect(
     const bool condition,
     const std::string_view description,
@@ -33,6 +37,25 @@ bool expect_cuda(
               << operation << ": " << cudaGetErrorString(result) << '\n';
     ++failures;
     return false;
+}
+
+[[nodiscard]] bool equal_float(const float left, const float right) {
+    return left == right || (std::isnan(left) && std::isnan(right));
+}
+
+[[nodiscard]] bool same_summary(
+    const satview::gpu::DistributionSummary& left,
+    const satview::gpu::DistributionSummary& right) {
+    return left.histogram.finite_count == right.histogram.finite_count &&
+        left.histogram.invalid_count == right.histogram.invalid_count &&
+        equal_float(left.histogram.minimum, right.histogram.minimum) &&
+        equal_float(left.histogram.maximum, right.histogram.maximum) &&
+        left.histogram.bins == right.histogram.bins &&
+        equal_float(left.percentile_1, right.percentile_1) &&
+        equal_float(left.percentile_2, right.percentile_2) &&
+        equal_float(left.percentile_50, right.percentile_50) &&
+        equal_float(left.percentile_98, right.percentile_98) &&
+        equal_float(left.percentile_99, right.percentile_99);
 }
 
 __global__ void fill_full_page(float* values, const std::size_t count) {
@@ -122,6 +145,12 @@ void test_mixed_extrema(cudaStream_t stream, int& failures) {
         std::isfinite(result.summary.percentile_1) &&
             std::isfinite(result.summary.percentile_99),
         "wide-range percentiles remain finite",
+        failures);
+    const auto canonical =
+        satview::gpu::summarize_distribution(result.summary.histogram);
+    expect(
+        same_summary(result.summary, canonical),
+        "async result uses the canonical host summarizer",
         failures);
     expect(
         result.elapsed_milliseconds >= 0.0F,
@@ -249,7 +278,13 @@ int run_gpu_distribution_tests() {
         device_count == 0) {
         static_cast<void>(cudaGetLastError());
         std::cout << "GPU distribution tests skipped: no CUDA device\n";
-        return 0;
+#ifdef SATVIEW_REQUIRE_ACCELERATOR_TESTS
+        std::cerr << "GPU distribution certification requires a usable "
+                     "CUDA device\n";
+        return 1;
+#else
+        return kTestSkipped;
+#endif
     }
     if (count_status != cudaSuccess) {
         std::cerr << "GPU distribution tests could not query the device: "

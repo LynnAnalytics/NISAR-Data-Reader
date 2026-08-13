@@ -77,6 +77,44 @@ same 4x4 GCOV smoke passed at 41.95 ms HDF5, 0.666 ms upload, and 0.977 ms
 CUDA. Forced CPU in that build measured 51.01 ms HDF5, 2.22 ms upload, and
 2.85 ms processing; the CUDA-free automatic path also passed.
 
+## Current exact CPU histogram optimization
+
+The CPU histogram now partitions inputs of at least 1,048,576 values into
+bounded worker ranges, builds local counts/extrema/bins, and reduces them in a
+deterministic order. Inputs below that threshold retain the serial path. Tests
+compare the result exactly with the serial oracle at both sides of the
+threshold and at 4,194,304 values, including signed zero, extreme finite
+values, denormals, and non-finite inputs.
+
+On the 4,194,304-value alternating A/B benchmark, p50 fell from `14.30 ms` to
+`2.07 ms`, about `6.9x`; p95 fell from `15.16 ms` to `2.44 ms`. Bin counts,
+finite/invalid counts, and extrema were exact. This is a histogram-kernel
+measurement, not an end-to-end viewer latency claim.
+
+## Remaining measured optimization priorities
+
+The following are candidates, not implemented speedups. Each still requires
+exact-output gates and paired end-to-end timing before promotion:
+
+| Priority | Opportunity | Current evidence / next experiment |
+| ---: | --- | --- |
+| 1 | Fuse sparse overview sampling into chunk decode | A representative GSLC Fit Scene remains about 7.7-9.7 s while reconstructing roughly 17.27 GiB of science and 2.16 GiB of mask data to retain about 129 MiB at stride 17x9. Decode only the exact requested lattice without changing bytes or fallback gates. |
+| 2 | Reuse overlapping native chunks across pans | A one-chunk 4x4 shift preserves 12 of 16 chunks but currently rereads all 16. Representative HDF5 work is 42-50 ms while CUDA processing is about 1 ms. Reuse must retain request/mask identity and edge correctness. |
+| 3 | Transfer CPU overview ownership directly to staging | The current approximately 135 MiB handoff costs about 17 ms and raises peak working set. Measure move/ownership transfer through publication without weakening cancellation lifetime. |
+| 4 | Keep a persistent CPU executor | Per-operation thread creation/join costs about 0.84-0.94 ms and creates a visible 65,536-item scheduling boundary. Compare a bounded persistent pool against the exact serial/parallel oracles. |
+| 5 | Remove first-use scratch overheads | First filtered CPU scratch zero-fill costs 3.65-3.95 ms; first CUDA speckle scratch allocation adds about 0.84 ms. Reuse or initialize only written regions, with invalid-border tests. |
+| 6 | Overlap overview H2D and reduce presentation stalls | A representative overview H2D is 5.47-5.61 ms. Test asynchronous transfer and multiple host-visible Vulkan staging buffers; keep external-timeline ownership and ready-only publication unchanged. |
+| 7 | Decouple request cadence from the visual transition | The fixed 120 ms crossfade limits replacement cadence to about 8.3 transitions/s when scheduling waits for it. Measure independent preparation/publication while retaining coverage-aware blending. |
+
+Native HDF5 remains the first optimization target: steady-state representative
+chunk timings are about 1.35 ms HDF5 versus 0.08 ms H2D and 0.03 ms CUDA for
+GCOV, and 0.57/0.10/0.05 ms respectively for GSLC. None of these candidates
+adds a persistent cache; current pages remain bounded and session-only.
+
+Composite navigation already reuses an identical active, prepared, or resident
+page by canonical recipe/window/stride identity; split and swipe share one
+packed pair page. No speedup is claimed for that scheduling change.
+
 ## Overlapped pipeline results
 
 | Product / layer | Measured / warmup chunks | Pipeline ms | Chunks/s | Logical GiB/s | HDF5 p50/p95 ms | H2D p50/p95 ms | CUDA p50/p95 ms |
@@ -456,10 +494,18 @@ Performance changes must retain:
 - a zero-filter-kernel **None** path that preserves the original transform;
 - exact distribution finite/invalid counts, extrema, and histogram accounting,
   with percentile/preset behavior bounded by the documented 256-bin estimate;
+- exact Pauli linear-channel formulas for synthetic surface, double-bounce,
+  cross-pol, and mixed cases; deterministic 10-bit/dB display packing; and
+  rejection of missing, misaligned, mistyped, masked, or non-finite terms;
+- exact-grid comparison capability checks, independent bfloat16 validity for
+  split/swipe, full-float `A - B`, and epsilon-safe linear-power ratio dB;
+- bounded aligned multi-raster streaming, shared-mask deduplication, stale-plan
+  rejection, deterministic rebuilds, and cancellation with no partial derived
+  page or persistent cache;
 - request identity that includes filter type, window, and Lee ENL so stale GPU
   pages or distributions cannot be mislabeled;
-- byte-identical LOD cache output across HDF5 handle reuse, direct decoding, and
-  cache-checksum version changes;
+- byte-identical in-memory LOD output across HDF5 handle reuse, direct decoding,
+  repeated builds, and bounded decode-worker scheduling;
 - direct-versus-`H5Dread` equality plus strict native-layout, filter-pipeline,
   filter-mask, one-chunk, allocation, and decoded-size gates with safe fallback;
 - canonical 1x1/2x2/4x4 geometry, edge shifting, partial bottom/right chunks,
@@ -469,9 +515,9 @@ Performance changes must retain:
   resident-selection invariants;
 - guarded regional power-of-two selection, the 1.25-texel physical-pixel target,
   4096x4096 capacity fallback, globally quantized origins, and level alignment;
-- exact sparse science/mask co-sampling, source-window/stride cache identity,
-  cache validation/corruption recovery, stale-completion rejection, and
-  cancellation without a partial final entry;
+- exact sparse science/mask co-sampling, canonical source-window/stride plan
+  identity, source/dataset fingerprint revalidation, stale-completion rejection,
+  and cancellation with no partially ready payload;
 - validity-authoritative Smooth sampling, finite-neighbor renormalization,
   circular phase interpolation, and nearest-texel Exact Pixels;
 - ready-only dual-image publication and a coverage-aware 120 ms crossfade that

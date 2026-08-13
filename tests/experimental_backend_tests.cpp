@@ -15,6 +15,10 @@
 
 namespace {
 
+#ifndef SATVIEW_REQUIRE_ACCELERATOR_TESTS
+constexpr int kTestSkipped = 77;
+#endif
+
 void expect(
     const bool condition,
     const std::string_view description,
@@ -45,6 +49,72 @@ void expect(
     }
   }
   return true;
+}
+
+void test_filter_configuration(int& failures) {
+  using satview::cpu::SpeckleFilter;
+  using satview::experimental::PageRequest;
+  using satview::experimental::valid_filter_configuration;
+
+  PageRequest request;
+  expect(
+      !request.filter_enabled &&
+          request.speckle.filter == SpeckleFilter::none &&
+          valid_filter_configuration(request),
+      "default request is coherently unfiltered",
+      failures);
+
+  request.filter_enabled = true;
+  expect(
+      !valid_filter_configuration(request),
+      "enabled filtering rejects a none filter",
+      failures);
+
+  request.filter_enabled = false;
+  request.speckle.filter = SpeckleFilter::boxcar;
+  expect(
+      !valid_filter_configuration(request),
+      "disabled filtering rejects a configured Boxcar filter",
+      failures);
+
+  request.filter_enabled = true;
+  request.speckle.equivalent_number_of_looks =
+      std::numeric_limits<float>::quiet_NaN();
+  expect(
+      valid_filter_configuration(request),
+      "Boxcar ignores nonfinite Lee ENL",
+      failures);
+  request.speckle.equivalent_number_of_looks = 0.0F;
+  expect(
+      valid_filter_configuration(request),
+      "Boxcar ignores nonpositive Lee ENL",
+      failures);
+
+  request.speckle.filter = SpeckleFilter::lee;
+  request.speckle.equivalent_number_of_looks =
+      std::numeric_limits<float>::infinity();
+  expect(
+      !valid_filter_configuration(request),
+      "Lee rejects nonfinite ENL",
+      failures);
+  request.speckle.equivalent_number_of_looks = 0.0F;
+  expect(
+      !valid_filter_configuration(request),
+      "Lee rejects nonpositive ENL",
+      failures);
+
+  request.speckle.filter = SpeckleFilter::boxcar;
+  request.speckle.domain = static_cast<satview::cpu::SpeckleDomain>(255);
+  expect(
+      !valid_filter_configuration(request),
+      "filtering rejects an invalid speckle domain",
+      failures);
+  request.filter_enabled = false;
+  request.speckle.filter = SpeckleFilter::none;
+  expect(
+      !valid_filter_configuration(request),
+      "unfiltered processing rejects an invalid speckle domain",
+      failures);
 }
 
 template <typename Process>
@@ -103,6 +173,7 @@ void test_backend(
       satview::cpu::ComplexTransform::imaginary,
   };
   request.filter_enabled = false;
+  request.speckle.filter = satview::cpu::SpeckleFilter::none;
   for (const auto transform : complex_transforms) {
     satview::cpu::transform_complex(
         science, expected, transform, validity);
@@ -166,6 +237,8 @@ void test_backend(
 
 int main() {
   int failures = 0;
+  test_filter_configuration(failures);
+  bool runtime_skipped = false;
 #if defined(SATVIEW_HAS_EXPERIMENTAL_HIP)
   {
     std::string reason;
@@ -174,6 +247,7 @@ int main() {
           "HIP/ROCm", satview::experimental::process_hip, failures);
     } else {
       std::cout << "HIP/ROCm experimental tests skipped: " << reason << '\n';
+      runtime_skipped = true;
     }
   }
 #endif
@@ -185,8 +259,21 @@ int main() {
           "oneAPI/SYCL", satview::experimental::process_sycl, failures);
     } else {
       std::cout << "oneAPI/SYCL experimental tests skipped: " << reason << '\n';
+      runtime_skipped = true;
     }
   }
 #endif
-  return failures == 0 ? 0 : 1;
+  if (failures != 0) {
+    return 1;
+  }
+  if (runtime_skipped) {
+#ifdef SATVIEW_REQUIRE_ACCELERATOR_TESTS
+    std::cerr << "Experimental accelerator certification requires every "
+                 "built backend runtime\n";
+    return 1;
+#else
+    return kTestSkipped;
+#endif
+  }
+  return 0;
 }

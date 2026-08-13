@@ -13,12 +13,13 @@
 #include <vector>
 
 int run_distribution_tests();
-#ifdef SATVIEW_HAS_CUDA
-int run_gpu_distribution_tests();
-int run_gpu_transform_tests();
-#endif
+int run_aligned_reader_tests(const satview::Hdf5Product& product);
+int run_analysis_catalog_tests();
 int run_colormap_tests();
+int run_composite_scientific_tests();
+int run_composite_worker_tests(const satview::Hdf5Product& product);
 int run_cpu_scientific_tests();
+int run_synthetic_overview_tests();
 int run_overview_tests(const satview::Hdf5Product& product);
 int run_overview_spacing_tests(const satview::Hdf5Product& product);
 int run_real_mosaic_plan_tests(const satview::Hdf5Product& product);
@@ -26,6 +27,16 @@ int run_resident_view_tests();
 int run_viewer_math_tests();
 
 namespace {
+
+constexpr std::string_view kGcovFixture =
+    "NISAR_L2_PR_GCOV_026_012_D_067_2005_QPDH_A_"
+    "20260721T005826_20260721T005901_P05023_N_F_J_001.h5";
+constexpr std::string_view kGslc128Fixture =
+    "NISAR_L2_PR_GSLC_025_128_A_015_2005_DHDH_M_"
+    "20260717T013518_20260717T013553_P05023_N_F_J_001.h5";
+constexpr std::string_view kGslc169Fixture =
+    "NISAR_L2_PR_GSLC_025_169_A_013_2005_DHDH_A_"
+    "20260719T214929_20260719T215001_P05023_N_F_J_001.h5";
 
 struct TestContext {
   int failures = 0;
@@ -56,16 +67,14 @@ std::filesystem::path data_directory() {
   return std::filesystem::path(SATVIEW_DEFAULT_TEST_DATA_DIR);
 }
 
-std::filesystem::path find_product(const std::filesystem::path &directory,
-                                   std::string_view marker) {
-  for (const auto &entry : std::filesystem::directory_iterator(directory)) {
-    if (entry.is_regular_file() && entry.path().extension() == ".h5" &&
-        entry.path().filename().string().find(marker) != std::string::npos) {
-      return entry.path();
-    }
+std::filesystem::path require_product(
+    const std::filesystem::path &directory, std::string_view filename) {
+  const auto product = directory / std::string(filename);
+  if (std::filesystem::is_regular_file(product)) {
+    return product;
   }
-  throw std::runtime_error("missing test product containing " +
-                           std::string(marker));
+  throw std::runtime_error("missing required test product: " +
+                           product.string());
 }
 
 struct FloatPair {
@@ -216,6 +225,8 @@ void test_gcov_chunk_boundaries(TestContext &test,
 
 void test_gcov(TestContext &test, const std::filesystem::path &file) {
   const satview::Hdf5Product product(file);
+  test.failures += run_aligned_reader_tests(product);
+  test.failures += run_composite_worker_tests(product);
   test.failures += run_overview_tests(product);
   test.failures += run_real_mosaic_plan_tests(product);
   test.expect(product.identification().product_type ==
@@ -380,40 +391,56 @@ void test_gslc(TestContext &test, const std::filesystem::path &file,
 
 } // namespace
 
-int main() {
+int main(const int argc, char **const argv) {
+  bool run_real_data = false;
+  if (argc == 2 && std::string_view(argv[1]) == "--real-data") {
+    run_real_data = true;
+  } else if (argc != 1) {
+    std::cerr << "Usage: satview-tests [--real-data]\n";
+    return 2;
+  }
+
   TestContext test;
-  test.failures += run_colormap_tests();
-  test.failures += run_cpu_scientific_tests();
-  test.failures += run_distribution_tests();
-  test.failures += run_resident_view_tests();
-  test.failures += run_viewer_math_tests();
-  try {
-    const auto directory = data_directory();
-    test.expect(std::filesystem::is_directory(directory),
-                "test-data directory exists");
-    if (std::filesystem::is_directory(directory)) {
-      const auto gcov = find_product(directory, "_GCOV_");
-      test_open_option_validation(test, gcov);
-      test_gcov(test, gcov);
-      test_gslc(test, find_product(directory, "_128_"), 67824, 34488, 32640,
-                33912, 17244, {-0.0526123046875F, -0.036163330078125F});
-      test_gslc(test, find_product(directory, "_169_"), 66672, 34056, 32650,
-                33336, 17028, {-0.046600341796875F, 0.67578125F});
+  if (run_real_data) {
+    try {
+      const auto directory = data_directory();
+      test.expect(std::filesystem::is_directory(directory),
+                  "test-data directory exists");
+      if (std::filesystem::is_directory(directory)) {
+        const auto gcov = require_product(directory, kGcovFixture);
+        test_open_option_validation(test, gcov);
+        test_gcov(test, gcov);
+        test_gslc(test, require_product(directory, kGslc128Fixture), 67824,
+                  34488, 32640, 33912, 17244,
+                  {-0.0526123046875F, -0.036163330078125F});
+        test_gslc(test, require_product(directory, kGslc169Fixture), 66672,
+                  34056, 32650, 33336, 17028,
+                  {-0.046600341796875F, 0.67578125F});
+      }
+    } catch (const std::exception &error) {
+      ++test.failures;
+      std::cerr << "FAIL: real-data tests threw: " << error.what() << '\n';
     }
-  } catch (const std::exception &error) {
-    ++test.failures;
-    std::cerr << "FAIL: real-data tests threw: " << error.what() << '\n';
+  } else {
+    test.failures += run_analysis_catalog_tests();
+    test.failures += run_colormap_tests();
+    test.failures += run_composite_scientific_tests();
+    test.failures += run_cpu_scientific_tests();
+    test.failures += run_distribution_tests();
+    test.failures += run_synthetic_overview_tests();
+    test.failures += run_resident_view_tests();
+    test.failures += run_viewer_math_tests();
   }
 
-#ifdef SATVIEW_HAS_CUDA
-  test.failures += run_gpu_distribution_tests();
-  test.failures += run_gpu_transform_tests();
-#endif
-
-  if (test.failures == 0) {
-    std::cout << "All satview tests passed\n";
-    return 0;
+  if (test.failures != 0) {
+    std::cerr << test.failures << " test(s) failed\n";
+    return 1;
   }
-  std::cerr << test.failures << " test(s) failed\n";
-  return 1;
+
+  if (run_real_data) {
+    std::cout << "All satview real-data tests passed\n";
+  } else {
+    std::cout << "All satview unit tests passed\n";
+  }
+  return 0;
 }

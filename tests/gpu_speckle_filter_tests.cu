@@ -18,6 +18,16 @@
 
 namespace {
 
+#ifndef SATVIEW_REQUIRE_ACCELERATOR_TESTS
+constexpr int kTestSkipped = 77;
+#endif
+
+enum class RunMode {
+    tests_and_benchmark,
+    tests_only,
+    benchmark_only,
+};
+
 using satview::gpu::SpeckleDomain;
 using satview::gpu::SpeckleFilter;
 using satview::gpu::SpeckleFilterOptions;
@@ -1015,14 +1025,17 @@ void run_benchmarks(const cudaStream_t stream) {
 }  // namespace
 
 int main(const int argc, char** const argv) {
-    bool run_benchmark = true;
-    for (int index = 1; index < argc; ++index) {
-        if (std::string_view(argv[index]) == "--no-benchmark") {
-            run_benchmark = false;
-        } else {
-            std::cerr << "Unknown argument: " << argv[index] << '\n';
-            return 2;
-        }
+    RunMode mode = RunMode::tests_and_benchmark;
+    if (argc == 2 && std::string_view(argv[1]) == "--no-benchmark") {
+        mode = RunMode::tests_only;
+    } else if (argc == 2 &&
+               std::string_view(argv[1]) == "--benchmark-only") {
+        mode = RunMode::benchmark_only;
+    } else if (argc != 1) {
+        std::cerr
+            << "Usage: satview-speckle-tests "
+               "[--no-benchmark|--benchmark-only]\n";
+        return 2;
     }
 
     int device_count = 0;
@@ -1032,7 +1045,12 @@ int main(const int argc, char** const argv) {
         device_count == 0) {
         static_cast<void>(cudaGetLastError());
         std::cout << "CUDA speckle tests skipped: no CUDA device\n";
-        return 0;
+#ifdef SATVIEW_REQUIRE_ACCELERATOR_TESTS
+        std::cerr << "FAIL: CUDA runtime tests require a usable device\n";
+        return 1;
+#else
+        return kTestSkipped;
+#endif
     }
     if (count_status != cudaSuccess) {
         std::cerr << "FAIL: cudaGetDeviceCount: "
@@ -1041,28 +1059,32 @@ int main(const int argc, char** const argv) {
     }
 
     try {
-        TestContext test;
         Stream stream;
-        test_option_identity(test);
-        test_passthrough(test, stream.get());
-        test_masks_borders_and_nonfinite(test, stream.get());
-        test_constant_and_windows(test, stream.get());
-        test_impulse_and_enl(test, stream.get());
-        test_domains(test, stream.get());
-        test_extreme_finite_values(test, stream.get());
-        test_determinism(test, stream.get());
-        test_validation(test);
-        test_launch_error_reporting(test);
-        if (test.failures != 0) {
-            std::cerr << test.failures
-                      << " CUDA speckle-filter test(s) failed\n";
-            return 1;
+        if (mode != RunMode::benchmark_only) {
+            TestContext test;
+            test_option_identity(test);
+            test_passthrough(test, stream.get());
+            test_masks_borders_and_nonfinite(test, stream.get());
+            test_constant_and_windows(test, stream.get());
+            test_impulse_and_enl(test, stream.get());
+            test_domains(test, stream.get());
+            test_extreme_finite_values(test, stream.get());
+            test_determinism(test, stream.get());
+            test_validation(test);
+            test_launch_error_reporting(test);
+            if (test.failures != 0) {
+                std::cerr << test.failures
+                          << " CUDA speckle-filter test(s) failed\n";
+                return 1;
+            }
         }
 
-        if (run_benchmark) {
+        if (mode != RunMode::tests_only) {
             run_benchmarks(stream.get());
         }
-        std::cout << "All CUDA speckle-filter tests passed\n";
+        if (mode != RunMode::benchmark_only) {
+            std::cout << "All CUDA speckle-filter tests passed\n";
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: CUDA speckle-filter test threw: "

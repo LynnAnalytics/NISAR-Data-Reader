@@ -19,6 +19,10 @@
 
 namespace {
 
+#ifndef SATVIEW_REQUIRE_ACCELERATOR_TESTS
+constexpr int kTestSkipped = 77;
+#endif
+
 template <typename T>
 class DeviceBuffer final {
 public:
@@ -910,7 +914,12 @@ int run_gpu_transform_tests() {
         count_status == cudaErrorInsufficientDriver || device_count == 0) {
         (void)cudaGetLastError();
         std::cout << "CUDA transform tests skipped: no CUDA device\n";
-        return 0;
+#ifdef SATVIEW_REQUIRE_ACCELERATOR_TESTS
+        std::cerr << "CUDA transform certification requires a usable device\n";
+        return 1;
+#else
+        return kTestSkipped;
+#endif
     }
     if (count_status != cudaSuccess) {
         std::cerr << "CUDA transform tests could not query the device: "

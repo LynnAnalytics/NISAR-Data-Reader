@@ -1,5 +1,6 @@
 #include "satview/hdf5_product.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -54,6 +55,23 @@ std::string_view to_string(StorageLayout value) {
     return "unknown";
 }
 
+json finite_or_symbolic_number(const double value) {
+    if (std::isnan(value)) return "NaN";
+    if (std::isinf(value)) return std::signbit(value) ? "-Infinity" : "Infinity";
+    return value;
+}
+
+json fill_value_json(const FillValue& fill) {
+    if (fill.numeric) return finite_or_symbolic_number(*fill.numeric);
+    if (fill.complex) {
+        return {
+            {"real", finite_or_symbolic_number(fill.complex->real)},
+            {"imaginary", finite_or_symbolic_number(fill.complex->imaginary)},
+        };
+    }
+    return {{"unavailable", true}};
+}
+
 json dataset_json(const DatasetInfo& layer) {
     json filters = json::array();
     for (const auto& filter : layer.filters) {
@@ -89,10 +107,15 @@ json dataset_json(const DatasetInfo& layer) {
     } else {
         result["chunks"] = nullptr;
     }
+    result["creation_fill_value"] = layer.creation_fill_value
+                                          ? fill_value_json(*layer.creation_fill_value)
+                                          : json(nullptr);
+    result["fill_value_attribute"] = layer.fill_value_attribute
+                                          ? fill_value_json(*layer.fill_value_attribute)
+                                          : json(nullptr);
     if (layer.fill_value_attribute) {
-        const auto& fill = *layer.fill_value_attribute;
-        if (fill.numeric) result["fill_value"] = *fill.numeric;
-        else if (fill.complex) result["fill_value"] = {{"real", fill.complex->real}, {"imaginary", fill.complex->imaginary}};
+        // Backward-compatible alias for the HDF5 _FillValue attribute.
+        result["fill_value"] = result["fill_value_attribute"];
     }
     return result;
 }

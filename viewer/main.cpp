@@ -7,6 +7,9 @@
 #include "colormaps.hpp"
 #include "overview_worker.hpp"
 
+#include "satview/analysis_catalog.hpp"
+#include "satview/composite_scientific.hpp"
+#include "satview/composite_worker.hpp"
 #include "satview/cpu/pageable_ring.hpp"
 #include "satview/cpu/scientific.hpp"
 #include "satview/distribution.hpp"
@@ -76,6 +79,8 @@ using ReadRingState = ReadRing::StateCounts;
 
 constexpr std::uint32_t kContiguousTileExtent = 2048;
 constexpr std::size_t kPinnedSlotCount = 3;
+constexpr std::size_t kMaximumReadRingBytes =
+    512ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kMaximumMosaicChunks = 16;
 constexpr std::uint64_t kMaximumTileBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kMaximumMosaicBytes =
@@ -119,6 +124,42 @@ enum class ComputeBackend : std::uint8_t {
     sycl,
 };
 
+enum class AnalysisMode : std::uint8_t {
+    single_layer,
+    pauli_rgb,
+    compare_split,
+    compare_swipe,
+    compare_difference,
+    compare_ratio,
+};
+
+enum class DisplayEncoding : std::uint8_t {
+    scalar = 0,
+    pauli_rgb10 = 1,
+    compare_bfloat_pair = 2,
+};
+
+class CudaInitializationError final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+template <typename Function>
+void perform_cuda_initialization(
+    const std::string_view stage, Function&& function) {
+    try {
+        std::forward<Function>(function)();
+    } catch (const CudaInitializationError&) {
+        throw;
+    } catch (const std::exception& error) {
+        throw CudaInitializationError(
+            std::string(stage) + ": " + error.what());
+    } catch (...) {
+        throw CudaInitializationError(
+            std::string(stage) + ": unknown failure");
+    }
+}
+
 [[nodiscard]] constexpr std::string_view backend_name(
     const ComputeBackend backend) noexcept {
     switch (backend) {
@@ -147,6 +188,11 @@ struct Arguments {
     bool smoke_test = false;
     bool fit_scene = false;
     BackendPreference backend = BackendPreference::automatic;
+    AnalysisMode analysis = AnalysisMode::single_layer;
+    std::string layer_path;
+    std::string compare_layer_path;
+    std::string pauli_frequency = "A";
+    float compare_divider = 0.5F;
 };
 
 [[noreturn]] void usage_error(std::string_view message) {
@@ -156,6 +202,9 @@ struct Arguments {
               "[--speckle none|boxcar|lee] [--speckle-window 3|5|7] "
               "[--speckle-looks N] "
               "[--rotation DEGREES] "
+              "[--analysis single|pauli|split|swipe|difference|ratio] "
+              "[--layer HDF5_PATH] [--compare-layer HDF5_PATH] "
+              "[--pauli-frequency A|B] [--compare-divider 0..1] "
               "[--backend auto|cuda|cpu|hip|sycl] "
               "[--clean-view] "
               "[--fit-scene] [--frames N | --smoke-test] "
@@ -173,6 +222,9 @@ Arguments parse_arguments(const int argc, char** argv) {
                    "[--speckle none|boxcar|lee] [--speckle-window 3|5|7] "
                    "[--speckle-looks N] "
                    "[--rotation DEGREES] "
+                   "[--analysis single|pauli|split|swipe|difference|ratio] "
+                   "[--layer HDF5_PATH] [--compare-layer HDF5_PATH] "
+                   "[--pauli-frequency A|B] [--compare-divider 0..1] "
                    "[--backend auto|cuda|cpu|hip|sycl] "
                    "[--clean-view] "
                    "[--fit-scene] [--frames N | --smoke-test] "
@@ -183,6 +235,12 @@ Arguments parse_arguments(const int argc, char** argv) {
                    "  --speckle-window N  initial 3x3, 5x5, or 7x7 window\n"
                    "  --speckle-looks N   initial Lee equivalent looks (> 0)\n"
                    "  --rotation N  initial clockwise rotation in degrees\n"
+                   "  --analysis A  single layer, Pauli RGB, split/swipe, "
+                   "difference, or ratio\n"
+                   "  --layer PATH  initial primary HDF5 science dataset\n"
+                   "  --compare-layer PATH  initial comparison science dataset\n"
+                   "  --pauli-frequency F  full-polarimetric GCOV frequency\n"
+                   "  --compare-divider N  swipe divider from 0 through 1\n"
                    "  --backend B   compute backend; auto prefers CUDA\n"
                    "  --clean-view  start with the left controls hidden\n"
                    "  --fit-scene   start with the entire raster visible\n"
@@ -281,6 +339,68 @@ Arguments parse_arguments(const int argc, char** argv) {
                 usage_error("--rotation requires a finite degree value");
             }
             result.rotation_degrees = parsed;
+            continue;
+        }
+        if (argument == "--analysis") {
+            if (++index >= argc) {
+                usage_error(
+                    "--analysis requires single, pauli, split, swipe, difference, or ratio");
+            }
+            const std::string_view name(argv[index]);
+            if (name == "single") {
+                result.analysis = AnalysisMode::single_layer;
+            } else if (name == "pauli") {
+                result.analysis = AnalysisMode::pauli_rgb;
+            } else if (name == "split") {
+                result.analysis = AnalysisMode::compare_split;
+            } else if (name == "swipe") {
+                result.analysis = AnalysisMode::compare_swipe;
+            } else if (name == "difference") {
+                result.analysis = AnalysisMode::compare_difference;
+            } else if (name == "ratio") {
+                result.analysis = AnalysisMode::compare_ratio;
+            } else {
+                usage_error(
+                    "--analysis requires single, pauli, split, swipe, difference, or ratio");
+            }
+            continue;
+        }
+        if (argument == "--layer" || argument == "--compare-layer") {
+            if (++index >= argc || std::string_view(argv[index]).empty()) {
+                usage_error(std::string(argument) + " requires an HDF5 path");
+            }
+            if (argument == "--layer") {
+                result.layer_path = argv[index];
+            } else {
+                result.compare_layer_path = argv[index];
+            }
+            continue;
+        }
+        if (argument == "--pauli-frequency") {
+            if (++index >= argc) {
+                usage_error("--pauli-frequency requires A or B");
+            }
+            const std::string_view name(argv[index]);
+            if (name != "A" && name != "B") {
+                usage_error("--pauli-frequency requires A or B");
+            }
+            result.pauli_frequency = name;
+            continue;
+        }
+        if (argument == "--compare-divider") {
+            if (++index >= argc) {
+                usage_error("--compare-divider requires a value from 0 through 1");
+            }
+            const std::string_view text(argv[index]);
+            float parsed = 0.0F;
+            const auto [end, error] = std::from_chars(
+                text.data(), text.data() + text.size(), parsed);
+            if (text.empty() || error != std::errc{} ||
+                end != text.data() + text.size() || !std::isfinite(parsed) ||
+                parsed < 0.0F || parsed > 1.0F) {
+                usage_error("--compare-divider requires a value from 0 through 1");
+            }
+            result.compare_divider = parsed;
             continue;
         }
         if (argument == "--backend") {
@@ -579,6 +699,27 @@ struct ProductView {
     std::uint32_t maximum_mosaic_width = 0;
 };
 
+[[nodiscard]] std::optional<std::size_t> find_layer_index(
+    const ProductView& view,
+    const std::string_view dataset_path) noexcept {
+    for (std::size_t index = 0; index < view.layers.size(); ++index) {
+        if (view.layers[index].dataset != nullptr &&
+            view.layers[index].dataset->path == dataset_path) {
+            return index;
+        }
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] bool mode_available_for(
+    const satview::DatasetInfo& layer,
+    const DisplayMode mode) {
+    const auto choices = modes_for(layer);
+    return std::any_of(
+        choices.begin(), choices.end(),
+        [mode](const ModeChoice& choice) { return choice.mode == mode; });
+}
+
 ProductView build_product_view(const satview::Hdf5Product& product) {
     ProductView result;
     for (const auto& dataset : product.datasets()) {
@@ -637,10 +778,10 @@ ProductView build_product_view(const satview::Hdf5Product& product) {
         view.label = semantic_layer_label(dataset);
         view.tile_height = static_cast<std::uint32_t>(source_height);
         view.tile_width = static_cast<std::uint32_t>(source_width);
-        view.tile_rows =
-            (dataset.dimensions[0] + source_height - 1) / source_height;
-        view.tile_columns =
-            (dataset.dimensions[1] + source_width - 1) / source_width;
+        view.tile_rows = satview::viewer::detail::ceil_div(
+            dataset.dimensions[0], source_height);
+        view.tile_columns = satview::viewer::detail::ceil_div(
+            dataset.dimensions[1], source_width);
         if (const auto* frequency = product.find_frequency(dataset.frequency)) {
             if (std::isfinite(frequency->grid.x.spacing) &&
                 frequency->grid.x.spacing != 0.0) {
@@ -768,6 +909,7 @@ ProductView build_product_view(const satview::Hdf5Product& product) {
 enum class TileSourceKind : std::uint8_t {
     native_mosaic,
     raw_overview,
+    derived_composite,
 };
 
 struct TileRequest {
@@ -776,6 +918,7 @@ struct TileRequest {
     // of source identity; it only prevents a late result from regressing view.
     std::uint64_t camera_generation = 0;
     std::size_t layer_index = 0;
+    std::size_t compare_layer_index = std::numeric_limits<std::size_t>::max();
     std::uint64_t tile_row = 0;
     std::uint64_t tile_column = 0;
     DisplayMode mode = DisplayMode::power_db;
@@ -783,22 +926,32 @@ struct TileRequest {
     std::uint32_t mosaic_span = 1;
     satview::viewer::MosaicGeometry mosaic;
     TileSourceKind source_kind = TileSourceKind::native_mosaic;
+    AnalysisMode analysis = AnalysisMode::single_layer;
+    DisplayEncoding display_encoding = DisplayEncoding::scalar;
     // Caller-owned stable identity for the raw samples in an overview. Zero is
     // reserved for native mosaics so an uninitialized overview cannot become
     // a false resident-cache hit.
     std::uint64_t overview_identity = 0;
+    std::uint64_t composite_identity = 0;
 };
 
 [[nodiscard]] bool same_tile_source(
     const TileRequest& left,
     const TileRequest& right) noexcept {
     if (left.layer_index != right.layer_index ||
+        left.compare_layer_index != right.compare_layer_index ||
+        left.analysis != right.analysis ||
+        left.display_encoding != right.display_encoding ||
         left.source_kind != right.source_kind) {
         return false;
     }
     if (left.source_kind == TileSourceKind::raw_overview) {
         return left.overview_identity != 0 &&
             left.overview_identity == right.overview_identity;
+    }
+    if (left.source_kind == TileSourceKind::derived_composite) {
+        return left.composite_identity != 0 &&
+            left.composite_identity == right.composite_identity;
     }
     return left.mosaic == right.mosaic;
 }
@@ -817,15 +970,36 @@ struct ReadCompletion {
 
 [[nodiscard]] ReadRing make_read_ring(
     const std::size_t bytes_per_slot, const bool page_locked) {
+    if (bytes_per_slot == 0 || bytes_per_slot > kMaximumReadRingBytes) {
+        fail("packed read chunk exceeds the 512 MiB read-ring limit");
+    }
+    const std::size_t slot_count = std::min(
+        kPinnedSlotCount, kMaximumReadRingBytes / bytes_per_slot);
 #if defined(SATVIEW_HAS_CUDA)
-    return ReadRing(ReadRing::Options{
-        .slot_count = kPinnedSlotCount,
+    const ReadRing::Options options{
+        .slot_count = slot_count,
         .bytes_per_slot = bytes_per_slot,
         .page_locked = page_locked,
-    });
+    };
+    if (!page_locked) {
+        return ReadRing(options);
+    }
+    try {
+        return ReadRing(options);
+    } catch (const CudaInitializationError&) {
+        throw;
+    } catch (const std::exception& error) {
+        throw CudaInitializationError(
+            std::string("CUDA page-locked read-ring initialization failed: ") +
+            error.what());
+    } catch (...) {
+        throw CudaInitializationError(
+            "CUDA page-locked read-ring initialization failed: "
+            "unknown failure");
+    }
 #else
     static_cast<void>(page_locked);
-    return ReadRing(kPinnedSlotCount, bytes_per_slot);
+    return ReadRing(slot_count, bytes_per_slot);
 #endif
 }
 
@@ -916,139 +1090,153 @@ private:
                 request = std::exchange(requested_, std::nullopt);
             }
 
-            const auto& layer = view_.layers.at(request->layer_index);
-            const auto& dataset = *layer.dataset;
-            const auto canonical = satview::viewer::make_mosaic_geometry(
-                request->tile_row,
-                request->tile_column,
-                layer.tile_rows,
-                layer.tile_columns,
-                layer.tile_height,
-                layer.tile_width,
-                dataset.dimensions[0],
-                dataset.dimensions[1],
-                request->mosaic_span);
-            if (canonical != request->mosaic) {
-                ReadCompletion completion;
-                completion.request = *request;
-                completion.error = "mosaic request geometry is not canonical";
-                push_completion(std::move(completion));
-                continue;
-            }
-            const auto chunk_count = static_cast<std::uint32_t>(
-                canonical.chunk_rows * canonical.chunk_columns);
-            bool abandon = false;
-            for (std::uint32_t local_row = 0;
-                 local_row < canonical.chunk_rows && !abandon;
-                 ++local_row) {
-                for (std::uint32_t local_column = 0;
-                     local_column < canonical.chunk_columns;
-                     ++local_column) {
-                    if (stop.stop_requested() ||
-                        superseded(request->serial)) {
-                        abandon = true;
-                        break;
-                    }
-
+            try {
+                const auto& layer = view_.layers.at(request->layer_index);
+                const auto& dataset = *layer.dataset;
+                const auto canonical =
+                    satview::viewer::make_mosaic_geometry(request->tile_row,
+                                                          request->tile_column,
+                                                          layer.tile_rows,
+                                                          layer.tile_columns,
+                                                          layer.tile_height,
+                                                          layer.tile_width,
+                                                          dataset.dimensions[0],
+                                                          dataset.dimensions[1],
+                                                          request->mosaic_span);
+                if (canonical != request->mosaic) {
                     ReadCompletion completion;
                     completion.request = *request;
-                    completion.chunk_index =
-                        local_row * canonical.chunk_columns + local_column;
-                    completion.chunk_count = chunk_count;
-                    try {
-                        const auto row =
-                            canonical.pixel_row +
-                            static_cast<std::uint64_t>(local_row) *
-                                layer.tile_height;
-                        const auto column =
-                            canonical.pixel_column +
-                            static_cast<std::uint64_t>(local_column) *
-                                layer.tile_width;
-                        const auto height = std::min<std::uint64_t>(
-                            layer.tile_height,
-                            dataset.dimensions[0] - row);
-                        const auto width = std::min<std::uint64_t>(
-                            layer.tile_width,
-                            dataset.dimensions[1] - column);
-                        completion.plan = product_.make_read_plan(
-                            dataset.path, row, column, height, width);
-                        const auto& aligned = completion.plan->aligned;
-                        if (aligned.row < canonical.pixel_row ||
-                            aligned.column < canonical.pixel_column) {
-                            fail("source chunk alignment precedes mosaic bounds");
-                        }
-                        const auto destination_row =
-                            aligned.row - canonical.pixel_row;
-                        const auto destination_column =
-                            aligned.column - canonical.pixel_column;
-                        if (destination_row > canonical.pixel_height ||
-                            destination_column > canonical.pixel_width ||
-                            aligned.height >
-                                canonical.pixel_height - destination_row ||
-                            aligned.width >
-                                canonical.pixel_width - destination_column) {
-                            fail("source chunk alignment escapes mosaic bounds");
-                        }
-                        completion.destination_row = destination_row;
-                        completion.destination_column = destination_column;
-                        if (layer.validity_mask != nullptr) {
-                            completion.mask_plan = product_.make_read_plan(
-                                layer.validity_mask->path,
-                                aligned.row,
-                                aligned.column,
-                                aligned.height,
-                                aligned.width);
+                    completion.error =
+                        "mosaic request geometry is not canonical";
+                    push_completion(std::move(completion));
+                    continue;
+                }
+                const auto chunk_count = static_cast<std::uint32_t>(
+                    canonical.chunk_rows * canonical.chunk_columns);
+                bool abandon = false;
+                for (std::uint32_t local_row = 0;
+                     local_row < canonical.chunk_rows && !abandon;
+                     ++local_row) {
+                    for (std::uint32_t local_column = 0;
+                         local_column < canonical.chunk_columns;
+                         ++local_column) {
+                        if (stop.stop_requested() ||
+                            superseded(request->serial)) {
+                            abandon = true;
+                            break;
                         }
 
-                        auto filling = ring_.acquire_for_fill(stop);
-                        if (!filling) {
-                            abandon = true;
-                            break;
-                        }
-                        if (superseded(request->serial)) {
-                            filling.reset();
-                            abandon = true;
-                            break;
-                        }
-                        const auto started = Clock::now();
-                        product_.read_into(
-                            *completion.plan,
-                            filling.bytes().first(
-                                completion.plan->expected_bytes));
-                        std::size_t packed_bytes =
-                            completion.plan->expected_bytes;
-                        if (completion.mask_plan.has_value()) {
-                            if (packed_bytes > filling.capacity() ||
-                                completion.mask_plan->expected_bytes >
-                                    filling.capacity() - packed_bytes) {
-                                fail(
-                                    "validity-mask read exceeds pinned slot "
-                                    "capacity");
+                        ReadCompletion completion;
+                        completion.request = *request;
+                        completion.chunk_index =
+                            local_row * canonical.chunk_columns + local_column;
+                        completion.chunk_count = chunk_count;
+                        try {
+                            const auto row =
+                                canonical.pixel_row +
+                                static_cast<std::uint64_t>(local_row) *
+                                    layer.tile_height;
+                            const auto column =
+                                canonical.pixel_column +
+                                static_cast<std::uint64_t>(local_column) *
+                                    layer.tile_width;
+                            const auto height = std::min<std::uint64_t>(
+                                layer.tile_height, dataset.dimensions[0] - row);
+                            const auto width = std::min<std::uint64_t>(
+                                layer.tile_width,
+                                dataset.dimensions[1] - column);
+                            completion.plan = product_.make_read_plan(
+                                dataset.path, row, column, height, width);
+                            const auto& aligned = completion.plan->aligned;
+                            if (aligned.row < canonical.pixel_row ||
+                                aligned.column < canonical.pixel_column) {
+                                fail("source chunk alignment precedes mosaic "
+                                     "bounds");
                             }
+                            const auto destination_row =
+                                aligned.row - canonical.pixel_row;
+                            const auto destination_column =
+                                aligned.column - canonical.pixel_column;
+                            if (destination_row > canonical.pixel_height ||
+                                destination_column > canonical.pixel_width ||
+                                aligned.height >
+                                    canonical.pixel_height - destination_row ||
+                                aligned.width > canonical.pixel_width -
+                                                    destination_column) {
+                                fail("source chunk alignment escapes mosaic "
+                                     "bounds");
+                            }
+                            completion.destination_row = destination_row;
+                            completion.destination_column = destination_column;
+                            if (layer.validity_mask != nullptr) {
+                                completion.mask_plan = product_.make_read_plan(
+                                    layer.validity_mask->path,
+                                    aligned.row,
+                                    aligned.column,
+                                    aligned.height,
+                                    aligned.width);
+                            }
+
+                            auto filling = ring_.acquire_for_fill(stop);
+                            if (!filling) {
+                                abandon = true;
+                                break;
+                            }
+                            if (superseded(request->serial)) {
+                                filling.reset();
+                                abandon = true;
+                                break;
+                            }
+                            const auto started = Clock::now();
                             product_.read_into(
-                                *completion.mask_plan,
-                                filling.bytes().subspan(
-                                    packed_bytes,
-                                    completion.mask_plan->expected_bytes));
-                            packed_bytes +=
-                                completion.mask_plan->expected_bytes;
+                                *completion.plan,
+                                filling.bytes().first(
+                                    completion.plan->expected_bytes));
+                            std::size_t packed_bytes =
+                                completion.plan->expected_bytes;
+                            if (completion.mask_plan.has_value()) {
+                                if (packed_bytes > filling.capacity() ||
+                                    completion.mask_plan->expected_bytes >
+                                        filling.capacity() - packed_bytes) {
+                                    fail("validity-mask read exceeds pinned "
+                                         "slot "
+                                         "capacity");
+                                }
+                                product_.read_into(
+                                    *completion.mask_plan,
+                                    filling.bytes().subspan(
+                                        packed_bytes,
+                                        completion.mask_plan->expected_bytes));
+                                packed_bytes +=
+                                    completion.mask_plan->expected_bytes;
+                            }
+                            completion.hdf5_milliseconds =
+                                std::chrono::duration<double, std::milli>(
+                                    Clock::now() - started)
+                                    .count();
+                            filling.publish_ready(packed_bytes);
+                        } catch (const std::exception& error) {
+                            completion.plan.reset();
+                            completion.mask_plan.reset();
+                            completion.error = error.what();
+                            abandon = true;
                         }
-                        completion.hdf5_milliseconds =
-                            std::chrono::duration<double, std::milli>(
-                                Clock::now() - started)
-                                .count();
-                        filling.publish_ready(packed_bytes);
-                    } catch (const std::exception& error) {
-                        completion.plan.reset();
-                        completion.mask_plan.reset();
-                        completion.error = error.what();
-                        abandon = true;
-                    }
-                    push_completion(std::move(completion));
-                    if (abandon) {
-                        break;
+                        push_completion(std::move(completion));
+                        if (abandon) {
+                            break;
+                        }
                     }
                 }
+            } catch (const std::exception& error) {
+                ReadCompletion completion;
+                completion.request = *request;
+                completion.error = error.what();
+                push_completion(std::move(completion));
+            } catch (...) {
+                ReadCompletion completion;
+                completion.request = *request;
+                completion.error = "unknown tile-reader failure";
+                push_completion(std::move(completion));
             }
         }
     }
@@ -1190,9 +1378,18 @@ struct DisplayPushConstants {
     std::uint32_t sampling_mode = 0;
     std::uint32_t circular_phase = 0;
     std::uint32_t padding = 0;
+    // Composite pages remain one raw 32-bit image per publication. Encoding
+    // one is a compact Pauli RGB display word; encoding two is an atomic
+    // bfloat16 A/B pair. Quantitative analysis outputs use scalar encoding.
+    std::uint32_t display_encoding = 0;
+    // Zero is unused, one presents complete A/B panels, and two is a
+    // co-registered swipe controlled by compare_position.
+    std::uint32_t compare_layout = 0;
+    float compare_position = 0.5F;
+    std::uint32_t analysis_padding = 0;
 };
 
-static_assert(sizeof(DisplayPushConstants) == 112);
+static_assert(sizeof(DisplayPushConstants) == 128);
 static_assert(offsetof(DisplayPushConstants, colormap) == 12);
 static_assert(offsetof(DisplayPushConstants, window_uv_origin) == 16);
 static_assert(offsetof(DisplayPushConstants, window_uv_dx) == 24);
@@ -1202,6 +1399,9 @@ static_assert(offsetof(DisplayPushConstants, sample_weights) == 88);
 static_assert(offsetof(DisplayPushConstants, active_slots) == 96);
 static_assert(offsetof(DisplayPushConstants, sampling_mode) == 100);
 static_assert(offsetof(DisplayPushConstants, circular_phase) == 104);
+static_assert(offsetof(DisplayPushConstants, display_encoding) == 112);
+static_assert(offsetof(DisplayPushConstants, compare_layout) == 116);
+static_assert(offsetof(DisplayPushConstants, compare_position) == 120);
 
 struct TileUpload {
     TileRequest request;
@@ -1834,7 +2034,21 @@ private:
         VkImageCreateInfo image_create{};
         image_create.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         image_create.imageType = VK_IMAGE_TYPE_2D;
-        image_create.format = VK_FORMAT_R32_SFLOAT;
+        // One raw 32-bit channel transports both scalar float bits and packed
+        // composite words without floating-point canonicalization.
+        image_create.format = VK_FORMAT_R32_UINT;
+        VkFormatProperties scientific_format_properties{};
+        vkGetPhysicalDeviceFormatProperties(
+            physical_device_, image_create.format,
+            &scientific_format_properties);
+        constexpr VkFormatFeatureFlags required_scientific_features =
+            VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        if ((scientific_format_properties.optimalTilingFeatures &
+             required_scientific_features) !=
+            required_scientific_features) {
+            fail("Vulkan device cannot sample the raw R32_UINT science image");
+        }
         image_create.extent = {maximum_width_, maximum_height_, 1};
         image_create.mipLevels = 1;
         image_create.arrayLayers = 1;
@@ -1847,7 +2061,7 @@ private:
         for (auto& image : scientific_images_) {
         check_vk(
                 vkCreateImage(device_, &image_create, nullptr, &image.image),
-            "create R32F scientific image");
+            "create R32_UINT scientific image");
 
         VkMemoryRequirements requirements{};
             vkGetImageMemoryRequirements(
@@ -1871,7 +2085,7 @@ private:
         view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
             view.image = image.image;
         view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        view.format = VK_FORMAT_R32_SFLOAT;
+        view.format = VK_FORMAT_R32_UINT;
         view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         view.subresourceRange.levelCount = 1;
         view.subresourceRange.layerCount = 1;
@@ -2444,12 +2658,38 @@ public:
         std::uint32_t height,
         std::size_t element_size,
         std::uint64_t previous_vulkan_consumed) = 0;
+    // Publishes a complete, already transformed scalar or compact composite
+    // page. The pipeline copies the caller-owned span before returning.
+    virtual TileUpload upload_precomputed(
+        const TileRequest& request,
+        std::span<const float> values,
+        std::uint32_t width,
+        std::uint32_t height,
+        bool build_distribution,
+        std::uint64_t previous_vulkan_consumed) = 0;
     virtual std::optional<TileUpload> upload_chunk(
         ReadSlotLease ready,
         const ReadCompletion& completion,
         std::uint64_t previous_vulkan_consumed) = 0;
     virtual void discard(ReadSlotLease ready) = 0;
+    virtual void drain() noexcept = 0;
     virtual void set_layers(const ProductView& view) = 0;
+};
+
+class PipelineDrainGuard final {
+public:
+    explicit PipelineDrainGuard(TilePipeline& pipeline) noexcept
+        : pipeline_(pipeline) {}
+
+    ~PipelineDrainGuard() noexcept {
+        pipeline_.drain();
+    }
+
+    PipelineDrainGuard(const PipelineDrainGuard&) = delete;
+    PipelineDrainGuard& operator=(const PipelineDrainGuard&) = delete;
+
+private:
+    TilePipeline& pipeline_;
 };
 
 #if defined(SATVIEW_HAS_CUDA)
@@ -2478,17 +2718,11 @@ public:
                     reinterpret_cast<void**>(&mask_),
                     mask_capacity_),
                 "allocate persistent CUDA validity-mask mosaic");
-            filter_capacity_ =
-                satview::viewer::checked_mosaic_bytes(
-                    renderer_.maximum_height(),
-                    renderer_.maximum_width(),
-                    sizeof(float),
-                    kMaximumMosaicBytes);
-            check_cuda(
-                cudaMalloc(
-                    reinterpret_cast<void**>(&filter_input_),
-                    filter_capacity_),
-                "allocate persistent CUDA speckle-filter input");
+            filter_capacity_ = satview::viewer::checked_mosaic_bytes(
+                renderer_.maximum_height(),
+                renderer_.maximum_width(),
+                sizeof(float),
+                kMaximumMosaicBytes);
             for (std::size_t index = 0;
                  index < kMaximumMosaicChunks;
                  ++index) {
@@ -2665,37 +2899,45 @@ public:
         // The first copy invalidates the previous resident identity before any
         // portion of the persistent private source allocation is overwritten.
         resident_.reset();
-        check_cuda(
-            cudaEventRecord(h2d_started_[0], stream_),
-            "record raw overview H2D start");
-        check_cuda(
-            cudaMemcpyAsync(
+        bool staging_referenced = false;
+        try {
+            check_cuda(
+                cudaEventRecord(h2d_started_[0], stream_),
+                "record raw overview H2D start");
+            const cudaError_t science_copy = cudaMemcpyAsync(
                 science_,
                 science.data(),
                 expected_science_bytes,
                 cudaMemcpyHostToDevice,
-                stream_),
-            "copy raw overview science to CUDA");
-        if (validity_mask.has_value()) {
+                stream_);
+            staging_referenced = science_copy == cudaSuccess;
+            check_cuda(science_copy, "copy raw overview science to CUDA");
+            if (validity_mask.has_value()) {
+                check_cuda(
+                    cudaMemcpyAsync(
+                        mask_,
+                        validity_mask->data(),
+                        expected_mask_bytes,
+                        cudaMemcpyHostToDevice,
+                        stream_),
+                    "copy raw overview validity mask to CUDA");
+            }
             check_cuda(
-                cudaMemcpyAsync(
-                    mask_,
-                    validity_mask->data(),
-                    expected_mask_bytes,
-                    cudaMemcpyHostToDevice,
-                    stream_),
-                "copy raw overview validity mask to CUDA");
-        }
-        check_cuda(
-            cudaEventRecord(h2d_finished_[0], stream_),
-            "record raw overview H2D finish");
+                cudaEventRecord(h2d_finished_[0], stream_),
+                "record raw overview H2D finish");
 
-        // Unlike PinnedRing leases, arbitrary spans carry no asynchronous
-        // lifetime token. Complete only the private H2D stage before returning;
-        // the transform and Vulkan publication remain asynchronous.
-        check_cuda(
-            cudaEventSynchronize(h2d_finished_[0]),
-            "complete raw overview H2D");
+            // Arbitrary spans have no ring lease to retain their storage, so
+            // finish their H2D use before returning to the caller.
+            check_cuda(
+                cudaEventSynchronize(h2d_finished_[0]),
+                "complete raw overview H2D");
+            staging_referenced = false;
+        } catch (...) {
+            if (staging_referenced) {
+                static_cast<void>(cudaStreamSynchronize(stream_));
+            }
+            throw;
+        }
 
         resident_ = ResidentMosaic{
             .request = request,
@@ -2706,6 +2948,88 @@ public:
         };
         timing_h2d_count_ = 1;
         return launch_transform(*resident_, previous_vulkan_consumed);
+    }
+
+    TileUpload upload_precomputed(
+        const TileRequest& request,
+        const std::span<const float> values,
+        const std::uint32_t width,
+        const std::uint32_t height,
+        const bool build_distribution,
+        const std::uint64_t previous_vulkan_consumed) override {
+        if (timing_pending()) {
+            fail("composite page overwritten before CUDA copy completion");
+        }
+        if (width == 0 || height == 0 ||
+            width > renderer_.maximum_width() ||
+            height > renderer_.maximum_height()) {
+            fail("composite page extent exceeds the persistent GPU page");
+        }
+        const auto count = satview::viewer::checked_mosaic_bytes(
+            height, width, sizeof(std::uint8_t), kMaximumMosaicBytes);
+        const auto required = satview::viewer::checked_mosaic_bytes(
+            height, width, sizeof(float), kMaximumMosaicBytes);
+        if (values.size() != count) {
+            fail("composite page value count does not match its extent");
+        }
+
+        assembly_.reset();
+        resident_.reset();
+        if (previous_vulkan_consumed != 0) {
+            renderer_.timeline().enqueue_cuda_wait(
+                stream_, previous_vulkan_consumed);
+        }
+        check_cuda(
+            cudaEventRecord(h2d_started_[0], stream_),
+            "record composite H2D start");
+        check_cuda(
+            cudaMemcpyAsync(
+                renderer_.cuda_output(), values.data(), required,
+                cudaMemcpyHostToDevice, stream_),
+            "copy composite page to CUDA/Vulkan output");
+        check_cuda(
+            cudaEventRecord(h2d_finished_[0], stream_),
+            "record composite H2D finish");
+        check_cuda(
+            cudaEventRecord(kernel_started_, stream_),
+            "record composite processing start");
+        check_cuda(
+            cudaEventRecord(kernel_finished_, stream_),
+            "record composite processing finish");
+
+        if (build_distribution) {
+            const std::uint64_t generation = next_distribution_generation_++;
+            distribution_.enqueue(
+                static_cast<const float*>(renderer_.cuda_output()),
+                count,
+                stream_,
+                generation);
+            distribution_request_ = DistributionRequest{
+                .generation = generation,
+                .request = request,
+                .width = width,
+                .height = height,
+            };
+        }
+
+        const std::uint64_t cuda_ready = next_timeline_value_;
+        const std::uint64_t vulkan_consumed = cuda_ready + 1;
+        next_timeline_value_ += 2;
+        renderer_.timeline().enqueue_cuda_signal(stream_, cuda_ready);
+        // The worker completion owns `values`; finish the host read before the
+        // caller is allowed to replace that completion.
+        check_cuda(
+            cudaEventSynchronize(h2d_finished_[0]),
+            "complete composite H2D copy");
+        timing_h2d_count_ = 1;
+        timing_pending_ = true;
+        return TileUpload{
+            .request = request,
+            .cuda_ready_value = cuda_ready,
+            .vulkan_consumed_value = vulkan_consumed,
+            .width = width,
+            .height = height,
+        };
     }
 
     std::optional<TileUpload> upload_chunk(
@@ -2760,7 +3084,7 @@ public:
             if (science_bytes > science_capacity_) {
                 fail("science mosaic exceeds persistent CUDA allocation");
             }
-            // The first write destroys the previous cache identity before any
+            // The first write destroys the previous resident identity before any
             // portion of its persistent source mosaic can be overwritten.
             resident_.reset();
             assembly_ = AssemblyState{
@@ -2780,65 +3104,63 @@ public:
             fail("mosaic chunks arrived with inconsistent assembly metadata");
         }
 
-        const auto event_index =
-            static_cast<std::size_t>(completion.chunk_index);
-        check_cuda(
-            cudaEventRecord(h2d_started_[event_index], stream_),
-            "record mosaic chunk H2D start");
+        bool staging_referenced = false;
+        try {
+            const auto event_index =
+                static_cast<std::size_t>(completion.chunk_index);
+            check_cuda(cudaEventRecord(h2d_started_[event_index], stream_),
+                       "record mosaic chunk H2D start");
 
-        const auto mosaic_width =
-            static_cast<std::size_t>(
-                completion.request.mosaic.pixel_width);
-        const auto mosaic_height =
-            static_cast<std::size_t>(
+            const auto mosaic_width =
+                static_cast<std::size_t>(completion.request.mosaic.pixel_width);
+            const auto mosaic_height = static_cast<std::size_t>(
                 completion.request.mosaic.pixel_height);
-        const auto source_width =
-            static_cast<std::size_t>(plan.aligned.width);
-        const auto source_height =
-            static_cast<std::size_t>(plan.aligned.height);
-        const auto element_size = plan.data_type.element_size;
-        if (source_width >
-                std::numeric_limits<std::size_t>::max() / element_size ||
-            mosaic_width >
-                std::numeric_limits<std::size_t>::max() / element_size) {
-            fail("mosaic row pitch overflow");
-        }
-        const auto source_pitch = source_width * element_size;
-        const auto mosaic_pitch = mosaic_width * element_size;
-        const auto destination_row =
-            static_cast<std::size_t>(completion.destination_row);
-        const auto destination_column =
-            static_cast<std::size_t>(completion.destination_column);
-        if (destination_row > mosaic_height ||
-            destination_column > mosaic_width ||
-            source_height > mosaic_height - destination_row ||
-            source_width > mosaic_width - destination_column) {
-            fail("CUDA chunk destination escapes mosaic bounds");
-        }
-        if (source_height != 0 &&
-            (source_pitch >
-                 std::numeric_limits<std::size_t>::max() / source_height ||
-             source_pitch * source_height != plan.expected_bytes)) {
-            fail("science chunk byte count does not match its 2D extent");
-        }
-        if (destination_row >
-                std::numeric_limits<std::size_t>::max() / mosaic_pitch ||
-            destination_column >
-                std::numeric_limits<std::size_t>::max() / element_size) {
-            fail("mosaic science destination offset overflow");
-        }
-        const auto destination_row_offset = destination_row * mosaic_pitch;
-        const auto destination_column_offset =
-            destination_column * element_size;
-        if (destination_column_offset >
-            std::numeric_limits<std::size_t>::max() -
-                destination_row_offset) {
-            fail("mosaic science destination offset addition overflow");
-        }
-        const auto destination_offset =
-            destination_row_offset + destination_column_offset;
-        check_cuda(
-            cudaMemcpy2DAsync(
+            const auto source_width =
+                static_cast<std::size_t>(plan.aligned.width);
+            const auto source_height =
+                static_cast<std::size_t>(plan.aligned.height);
+            const auto element_size = plan.data_type.element_size;
+            if (source_width >
+                    std::numeric_limits<std::size_t>::max() / element_size ||
+                mosaic_width >
+                    std::numeric_limits<std::size_t>::max() / element_size) {
+                fail("mosaic row pitch overflow");
+            }
+            const auto source_pitch = source_width * element_size;
+            const auto mosaic_pitch = mosaic_width * element_size;
+            const auto destination_row =
+                static_cast<std::size_t>(completion.destination_row);
+            const auto destination_column =
+                static_cast<std::size_t>(completion.destination_column);
+            if (destination_row > mosaic_height ||
+                destination_column > mosaic_width ||
+                source_height > mosaic_height - destination_row ||
+                source_width > mosaic_width - destination_column) {
+                fail("CUDA chunk destination escapes mosaic bounds");
+            }
+            if (source_height != 0 &&
+                (source_pitch >
+                     std::numeric_limits<std::size_t>::max() / source_height ||
+                 source_pitch * source_height != plan.expected_bytes)) {
+                fail("science chunk byte count does not match its 2D extent");
+            }
+            if (destination_row >
+                    std::numeric_limits<std::size_t>::max() / mosaic_pitch ||
+                destination_column >
+                    std::numeric_limits<std::size_t>::max() / element_size) {
+                fail("mosaic science destination offset overflow");
+            }
+            const auto destination_row_offset = destination_row * mosaic_pitch;
+            const auto destination_column_offset =
+                destination_column * element_size;
+            if (destination_column_offset >
+                std::numeric_limits<std::size_t>::max() -
+                    destination_row_offset) {
+                fail("mosaic science destination offset addition overflow");
+            }
+            const auto destination_offset =
+                destination_row_offset + destination_column_offset;
+            const cudaError_t science_copy = cudaMemcpy2DAsync(
                 static_cast<std::byte*>(science_) + destination_offset,
                 mosaic_pitch,
                 ready.bytes().data(),
@@ -2846,58 +3168,62 @@ public:
                 source_pitch,
                 source_height,
                 cudaMemcpyHostToDevice,
-                stream_),
-            "assemble pinned science chunk into CUDA mosaic");
+                stream_);
+            staging_referenced = science_copy == cudaSuccess;
+            check_cuda(science_copy,
+                       "assemble pinned science chunk into CUDA mosaic");
 
-        if (completion.mask_plan.has_value()) {
-            const auto& mask_plan = *completion.mask_plan;
-            if (mask_plan.data_type.kind !=
-                    satview::ScalarKind::unsigned_integer ||
-                mask_plan.data_type.element_size != sizeof(std::uint8_t) ||
-                mask_plan.requested.row != plan.aligned.row ||
-                mask_plan.requested.column != plan.aligned.column ||
-                mask_plan.requested.height != plan.aligned.height ||
-                mask_plan.requested.width != plan.aligned.width) {
-                fail("validity-mask plan does not match its science chunk");
+            if (completion.mask_plan.has_value()) {
+                const auto& mask_plan = *completion.mask_plan;
+                if (mask_plan.data_type.kind !=
+                        satview::ScalarKind::unsigned_integer ||
+                    mask_plan.data_type.element_size != sizeof(std::uint8_t) ||
+                    mask_plan.requested.row != plan.aligned.row ||
+                    mask_plan.requested.column != plan.aligned.column ||
+                    mask_plan.requested.height != plan.aligned.height ||
+                    mask_plan.requested.width != plan.aligned.width) {
+                    fail("validity-mask plan does not match its science chunk");
+                }
+                if (mask_plan.requested_row_offset > mask_plan.aligned.height ||
+                    mask_plan.requested_column_offset >
+                        mask_plan.aligned.width ||
+                    plan.aligned.height > mask_plan.aligned.height -
+                                              mask_plan.requested_row_offset ||
+                    plan.aligned.width >
+                        mask_plan.aligned.width -
+                            mask_plan.requested_column_offset) {
+                    fail("validity-mask crop escapes its aligned source chunk");
+                }
+                const auto mask_source_offset = static_cast<std::size_t>(
+                    mask_plan.requested_row_offset * mask_plan.aligned.width +
+                    mask_plan.requested_column_offset);
+                const auto mask_destination_offset =
+                    destination_row * mosaic_width + destination_column;
+                const auto* mask_source =
+                    reinterpret_cast<const std::uint8_t*>(ready.bytes().data() +
+                                                          plan.expected_bytes) +
+                    mask_source_offset;
+                check_cuda(cudaMemcpy2DAsync(mask_ + mask_destination_offset,
+                                             mosaic_width,
+                                             mask_source,
+                                             static_cast<std::size_t>(
+                                                 mask_plan.aligned.width),
+                                             source_width,
+                                             source_height,
+                                             cudaMemcpyHostToDevice,
+                                             stream_),
+                           "assemble pinned validity chunk into CUDA mosaic");
             }
-            if (mask_plan.requested_row_offset >
-                    mask_plan.aligned.height ||
-                mask_plan.requested_column_offset >
-                    mask_plan.aligned.width ||
-                plan.aligned.height >
-                    mask_plan.aligned.height -
-                        mask_plan.requested_row_offset ||
-                plan.aligned.width >
-                    mask_plan.aligned.width -
-                        mask_plan.requested_column_offset) {
-                fail("validity-mask crop escapes its aligned source chunk");
+            check_cuda(cudaEventRecord(h2d_finished_[event_index], stream_),
+                       "record mosaic chunk H2D finish");
+            ready.mark_in_flight(stream_);
+            staging_referenced = false;
+        } catch (...) {
+            if (staging_referenced) {
+                static_cast<void>(cudaStreamSynchronize(stream_));
             }
-            const auto mask_source_offset = static_cast<std::size_t>(
-                mask_plan.requested_row_offset *
-                    mask_plan.aligned.width +
-                mask_plan.requested_column_offset);
-            const auto mask_destination_offset =
-                destination_row * mosaic_width + destination_column;
-            const auto* mask_source =
-                reinterpret_cast<const std::uint8_t*>(
-                    ready.bytes().data() + plan.expected_bytes) +
-                mask_source_offset;
-            check_cuda(
-                cudaMemcpy2DAsync(
-                    mask_ + mask_destination_offset,
-                    mosaic_width,
-                    mask_source,
-                    static_cast<std::size_t>(mask_plan.aligned.width),
-                    source_width,
-                    source_height,
-                    cudaMemcpyHostToDevice,
-                    stream_),
-                "assemble pinned validity chunk into CUDA mosaic");
+            throw;
         }
-        check_cuda(
-            cudaEventRecord(h2d_finished_[event_index], stream_),
-            "record mosaic chunk H2D finish");
-        ready.mark_in_flight(stream_);
 
         ++assembly_->uploaded_chunks;
         if (assembly_->uploaded_chunks != assembly_->expected_chunks) {
@@ -2921,6 +3247,12 @@ public:
     void discard(ReadSlotLease ready) override {
         if (ready) {
             ready.mark_in_flight(stream_);
+        }
+    }
+
+    void drain() noexcept override {
+        if (stream_ != nullptr) {
+            static_cast<void>(cudaStreamSynchronize(stream_));
         }
     }
 
@@ -2956,6 +3288,25 @@ private:
         std::uint32_t height = 0;
     };
 
+    void ensure_filter_scratch(const std::size_t required_bytes) {
+        if (required_bytes > filter_capacity_) {
+            fail("speckle-filter scratch capacity exceeded");
+        }
+        if (required_bytes <= filter_allocation_bytes_) {
+            return;
+        }
+        if (filter_input_ != nullptr) {
+            check_cuda(cudaFree(filter_input_), "resize CUDA filter scratch");
+            filter_input_ = nullptr;
+            filter_allocation_bytes_ = 0;
+        }
+        check_cuda(
+            cudaMalloc(
+                reinterpret_cast<void**>(&filter_input_), required_bytes),
+            "allocate CUDA speckle-filter scratch");
+        filter_allocation_bytes_ = required_bytes;
+    }
+
     TileUpload launch_transform(
         const ResidentMosaic& resident,
         const std::uint64_t previous_vulkan_consumed) {
@@ -2986,8 +3337,8 @@ private:
             resident.width,
             sizeof(float),
             kMaximumMosaicBytes);
-        if (filter_enabled && output_bytes > filter_capacity_) {
-            fail("speckle-filter scratch capacity exceeded");
+        if (filter_enabled) {
+            ensure_filter_scratch(output_bytes);
         }
         auto* const final_output =
             static_cast<float*>(renderer_.cuda_output());
@@ -3146,6 +3497,7 @@ private:
         if (filter_input_ != nullptr) {
             static_cast<void>(cudaFree(filter_input_));
             filter_input_ = nullptr;
+            filter_allocation_bytes_ = 0;
         }
         if (mask_ != nullptr) {
             static_cast<void>(cudaFree(mask_));
@@ -3165,6 +3517,7 @@ private:
     std::size_t science_capacity_ = 0;
     std::size_t mask_capacity_ = 0;
     std::size_t filter_capacity_ = 0;
+    std::size_t filter_allocation_bytes_ = 0;
     cudaStream_t stream_ = nullptr;
     void* science_ = nullptr;
     std::uint8_t* mask_ = nullptr;
@@ -3205,7 +3558,6 @@ public:
             kMaximumMosaicBytes);
         mask_.resize(maximum_pixels);
         output_.resize(maximum_pixels);
-        filter_input_.resize(maximum_pixels);
     }
 
     [[nodiscard]] std::string_view name() const noexcept override {
@@ -3313,6 +3665,63 @@ public:
             .has_validity = validity_mask.has_value(),
         };
         return launch_transform(*resident_);
+    }
+
+    TileUpload upload_precomputed(
+        const TileRequest& request,
+        const std::span<const float> values,
+        const std::uint32_t width,
+        const std::uint32_t height,
+        const bool build_distribution,
+        const std::uint64_t previous_vulkan_consumed) override {
+        static_cast<void>(previous_vulkan_consumed);
+        if (timing_pending()) {
+            fail("composite page overwritten before host publication");
+        }
+        if (width == 0 || height == 0) {
+            fail("composite page extent is empty");
+        }
+        const auto count = satview::viewer::checked_mosaic_bytes(
+            height, width, sizeof(std::uint8_t), kMaximumMosaicBytes);
+        if (values.size() != count || count > output_.size()) {
+            fail("composite page value count exceeds host capacity");
+        }
+
+        assembly_.reset();
+        resident_.reset();
+        const auto started = Clock::now();
+        std::copy(values.begin(), values.end(), output_.begin());
+        upload_milliseconds_ = static_cast<float>(
+            std::chrono::duration<double, std::milli>(Clock::now() - started)
+                .count());
+        processing_milliseconds_ = 0.0F;
+        timing_pending_ = true;
+
+        const auto output = std::span<const float>(output_).first(count);
+        if (build_distribution) {
+            const auto cpu_histogram = satview::cpu::build_histogram(output);
+            satview::gpu::DistributionHistogram histogram;
+            histogram.finite_count = cpu_histogram.finite_count;
+            histogram.invalid_count = cpu_histogram.invalid_count;
+            histogram.minimum = cpu_histogram.minimum;
+            histogram.maximum = cpu_histogram.maximum;
+            histogram.bins = cpu_histogram.bins;
+            distribution_ = DistributionCompletion{
+                .request = request,
+                .summary = satview::gpu::summarize_distribution(histogram),
+                .elapsed_milliseconds = 0.0F,
+                .width = width,
+                .height = height,
+            };
+        } else {
+            distribution_.reset();
+        }
+        return TileUpload{
+            .request = request,
+            .width = width,
+            .height = height,
+            .host_values = output,
+        };
     }
 
     std::optional<TileUpload> upload_chunk(
@@ -3489,6 +3898,8 @@ public:
         }
     }
 
+    void drain() noexcept override {}
+
     void set_layers(const ProductView& view) override {
         layer_lookup_.clear();
         layer_lookup_.reserve(view.layers.size());
@@ -3616,6 +4027,9 @@ private:
         const satview::experimental::PageRequest& request,
         const std::span<float> output) {
         const auto count = output.size();
+        if (request.filter_enabled && filter_input_.size() < count) {
+            filter_input_.resize(count);
+        }
         auto transformed = request.filter_enabled
             ? std::span<float>(filter_input_).first(count)
             : output;
@@ -4436,6 +4850,10 @@ ViewportUiResult build_ui(
     const VulkanRenderer& renderer,
     std::size_t& selected_layer,
     DisplayMode& mode,
+    AnalysisMode& analysis_mode,
+    std::size_t& compare_layer,
+    std::string& pauli_frequency,
+    const std::vector<satview::analysis::PauliCapability>& pauli_capabilities,
     SpeckleSettings& speckle,
     std::uint64_t& tile_row,
     std::uint64_t& tile_column,
@@ -4497,8 +4915,131 @@ ViewportUiResult build_ui(
             static_cast<int>(compute_backend.size()),
             compute_backend.data());
 
+        constexpr std::array<const char*, 6> analysis_labels{{
+            "Single layer",
+            "Pauli RGB decomposition",
+            "Layer compare - split",
+            "Layer compare - swipe",
+            "Difference A - B",
+            "Power ratio A / B (dB)",
+        }};
+        int analysis_index = static_cast<int>(analysis_mode);
+        if (ImGui::Combo(
+                "Analysis tool", &analysis_index, analysis_labels.data(),
+                static_cast<int>(analysis_labels.size()))) {
+            analysis_mode = static_cast<AnalysisMode>(analysis_index);
+            if (analysis_mode != AnalysisMode::single_layer) {
+                speckle = {};
+                display.sampling_mode = 1;
+            }
+            if (analysis_mode == AnalysisMode::pauli_rgb) {
+                mode = DisplayMode::power_db;
+                const auto capability = std::find_if(
+                    pauli_capabilities.begin(), pauli_capabilities.end(),
+                    [&](const satview::analysis::PauliCapability& candidate) {
+                        return candidate.frequency == pauli_frequency &&
+                            candidate.available && candidate.recipe.has_value();
+                    });
+                if (capability != pauli_capabilities.end()) {
+                    if (const auto layer_index = find_layer_index(
+                            view, capability->recipe->hhhh_dataset_path)) {
+                        selected_layer = *layer_index;
+                        tile_row =
+                            (view.layers[*layer_index].tile_rows - 1) / 2;
+                        tile_column =
+                            (view.layers[*layer_index].tile_columns - 1) / 2;
+                    }
+                }
+                display.low = -35.0F;
+                display.high = 5.0F;
+                display.gamma = 1.0F;
+            } else if (analysis_mode == AnalysisMode::compare_difference ||
+                       analysis_mode == AnalysisMode::compare_ratio) {
+                if (analysis_mode == AnalysisMode::compare_ratio) {
+                    mode = DisplayMode::power_db;
+                    display.circular_phase = 0;
+                }
+                display.low = -10.0F;
+                display.high = 10.0F;
+                display.gamma = 1.0F;
+                display.colormap = static_cast<std::uint32_t>(
+                    satview::viewer::ColormapId::cmweather_balance);
+            } else {
+                reset_display_for_mode(mode, display);
+            }
+            navigation.initialized = false;
+            request_tile = true;
+            result.immediate_request = true;
+        }
+
+        const bool composite_analysis =
+            analysis_mode != AnalysisMode::single_layer;
+        const bool compare_analysis =
+            analysis_mode == AnalysisMode::compare_split ||
+            analysis_mode == AnalysisMode::compare_swipe ||
+            analysis_mode == AnalysisMode::compare_difference ||
+            analysis_mode == AnalysisMode::compare_ratio;
+
+        if (analysis_mode == AnalysisMode::pauli_rgb) {
+            const auto capability = std::find_if(
+                pauli_capabilities.begin(), pauli_capabilities.end(),
+                [&](const satview::analysis::PauliCapability& candidate) {
+                    return candidate.frequency == pauli_frequency;
+                });
+            const char* frequency_label = pauli_frequency.c_str();
+            if (ImGui::BeginCombo("Polarimetric frequency", frequency_label)) {
+                for (const auto& candidate : pauli_capabilities) {
+                    const bool selected =
+                        candidate.frequency == pauli_frequency;
+                    if (!candidate.available) {
+                        ImGui::BeginDisabled();
+                    }
+                    if (ImGui::Selectable(
+                            candidate.frequency.c_str(), selected) &&
+                        candidate.available && candidate.recipe.has_value()) {
+                        pauli_frequency = candidate.frequency;
+                        if (const auto layer_index = find_layer_index(
+                                view,
+                                candidate.recipe->hhhh_dataset_path)) {
+                            selected_layer = *layer_index;
+                            mode = DisplayMode::power_db;
+                            tile_row =
+                                (view.layers[*layer_index].tile_rows - 1) / 2;
+                            tile_column =
+                                (view.layers[*layer_index].tile_columns - 1) / 2;
+                        }
+                        navigation.initialized = false;
+                        request_tile = true;
+                        result.immediate_request = true;
+                    }
+                    if (!candidate.available) {
+                        if (ImGui::IsItemHovered(
+                                ImGuiHoveredFlags_AllowWhenDisabled)) {
+                            ImGui::SetTooltip("%s", candidate.reason.c_str());
+                        }
+                        ImGui::EndDisabled();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            if (capability == pauli_capabilities.end() ||
+                !capability->available || !capability->recipe.has_value()) {
+                const char* reason = capability == pauli_capabilities.end()
+                    ? "Frequency is absent from this product."
+                    : capability->reason.c_str();
+                ImGui::TextWrapped("Pauli unavailable: %s", reason);
+            } else {
+                ImGui::TextDisabled(
+                    "Red: double bounce | Green: cross-pol | Blue: surface");
+            }
+        }
+
         const char* selected_label = view.layers[selected_layer].label.c_str();
-        if (ImGui::BeginCombo("Semantic layer", selected_label)) {
+        const char* primary_label = compare_analysis
+            ? "Primary layer"
+            : "Semantic layer";
+        if (analysis_mode != AnalysisMode::pauli_rgb &&
+            ImGui::BeginCombo(primary_label, selected_label)) {
             for (std::size_t index = 0; index < view.layers.size(); ++index) {
                 const bool selected = index == selected_layer;
                 if (ImGui::Selectable(view.layers[index].label.c_str(),
@@ -4525,13 +5066,99 @@ ViewportUiResult build_ui(
             ImGui::EndCombo();
         }
 
+        const auto compare_mode = [&]() {
+            switch (analysis_mode) {
+                case AnalysisMode::compare_split:
+                    return satview::analysis::CompareMode::swipe;
+                case AnalysisMode::compare_swipe:
+                    return satview::analysis::CompareMode::swipe;
+                case AnalysisMode::compare_difference:
+                    return satview::analysis::CompareMode::difference;
+                case AnalysisMode::compare_ratio:
+                    return satview::analysis::CompareMode::ratio;
+                default:
+                    return satview::analysis::CompareMode::side_by_side;
+            }
+        }();
+        if (compare_analysis) {
+            const auto compare_is_compatible = [&](const std::size_t index) {
+                if (index >= view.layers.size() || index == selected_layer ||
+                    !mode_available_for(*view.layers[index].dataset, mode)) {
+                    return false;
+                }
+                const auto capability =
+                    satview::analysis::resolve_compare_capability(
+                        product,
+                        view.layers[selected_layer].dataset->path,
+                        view.layers[index].dataset->path);
+                return capability.supports(compare_mode) &&
+                    capability.recipe.has_value() &&
+                    capability.recipe->strictly_aligned;
+            };
+            if (!compare_is_compatible(compare_layer)) {
+                compare_layer = selected_layer;
+                for (std::size_t index = 0; index < view.layers.size(); ++index) {
+                    if (compare_is_compatible(index)) {
+                        compare_layer = index;
+                        break;
+                    }
+                }
+            }
+            const char* compare_label = compare_layer < view.layers.size() &&
+                    compare_layer != selected_layer
+                ? view.layers[compare_layer].label.c_str()
+                : "No compatible layer";
+            if (ImGui::BeginCombo("Compare with", compare_label)) {
+                for (std::size_t index = 0; index < view.layers.size(); ++index) {
+                    if (index == selected_layer ||
+                        !mode_available_for(*view.layers[index].dataset, mode)) {
+                        continue;
+                    }
+                    const auto candidate =
+                        satview::analysis::resolve_compare_capability(
+                            product,
+                            view.layers[selected_layer].dataset->path,
+                            view.layers[index].dataset->path);
+                    const bool compatible = candidate.supports(compare_mode) &&
+                        candidate.recipe.has_value() &&
+                        candidate.recipe->strictly_aligned;
+                    if (!compatible) {
+                        continue;
+                    }
+                    const bool selected = index == compare_layer;
+                    if (ImGui::Selectable(
+                            view.layers[index].label.c_str(), selected)) {
+                        compare_layer = index;
+                        request_tile = true;
+                        result.immediate_request = true;
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            if (compare_layer == selected_layer ||
+                compare_layer >= view.layers.size()) {
+                ImGui::TextWrapped(
+                    "No same-grid layer supports this comparison and scientific mode.");
+            }
+            if (analysis_mode == AnalysisMode::compare_swipe) {
+                ImGui::SliderFloat(
+                    "Divider", &display.compare_position, 0.0F, 1.0F,
+                    "%.2f");
+            }
+        }
+
         const auto choices = modes_for(*view.layers[selected_layer].dataset);
         const auto current = std::find_if(
             choices.begin(), choices.end(),
             [mode](const ModeChoice& choice) { return choice.mode == mode; });
         const char* mode_label =
             current == choices.end() ? choices.front().label : current->label;
-        if (ImGui::BeginCombo("Scientific mode", mode_label)) {
+        if (analysis_mode != AnalysisMode::pauli_rgb &&
+            analysis_mode != AnalysisMode::compare_ratio &&
+            ImGui::BeginCombo("Scientific mode", mode_label)) {
             for (const auto& choice : choices) {
                 const bool selected = choice.mode == mode;
                 if (ImGui::Selectable(choice.label, selected)) {
@@ -4550,7 +5177,8 @@ ViewportUiResult build_ui(
 
         const auto& colormaps = satview::viewer::kColormapLabels;
         int colormap = static_cast<int>(display.colormap);
-        if (ImGui::Combo("Colormap", &colormap, colormaps.data(),
+        if (analysis_mode != AnalysisMode::pauli_rgb &&
+            ImGui::Combo("Colormap", &colormap, colormaps.data(),
                          static_cast<int>(colormaps.size()))) {
             display.colormap = static_cast<std::uint32_t>(colormap);
         }
@@ -4560,7 +5188,10 @@ ViewportUiResult build_ui(
             "Exact Pixels",
         }};
         int sampling_mode = static_cast<int>(display.sampling_mode);
-        if (ImGui::Combo("Sampling", &sampling_mode, sampling_labels.data(),
+        if (composite_analysis) {
+            display.sampling_mode = 1;
+            ImGui::TextDisabled("Composite analysis uses exact-pixel sampling.");
+        } else if (ImGui::Combo("Sampling", &sampling_mode, sampling_labels.data(),
                          static_cast<int>(sampling_labels.size()))) {
             display.sampling_mode = static_cast<std::uint32_t>(sampling_mode);
         }
@@ -4569,15 +5200,22 @@ ViewportUiResult build_ui(
             resident.has_value() && resident->layer_index == selected_layer
                 ? resident
                 : std::nullopt;
-        if (draw_speckle_controls(*view.layers[selected_layer].dataset, mode,
-                                  speckle_resident, speckle)) {
+        if (composite_analysis) {
+            ImGui::TextDisabled("Speckle filtering is unavailable for composite analysis.");
+        } else if (draw_speckle_controls(
+                       *view.layers[selected_layer].dataset, mode,
+                       speckle_resident, speckle)) {
             speckle_control_changed = true;
             request_tile = true;
             result.immediate_request = true;
         }
 
-        draw_distribution(view, selected_layer, mode, resident, distribution,
-                          display);
+        if (analysis_mode == AnalysisMode::single_layer ||
+            analysis_mode == AnalysisMode::compare_difference ||
+            analysis_mode == AnalysisMode::compare_ratio) {
+            draw_distribution(
+                view, selected_layer, mode, resident, distribution, display);
+        }
 
         ImGui::SeparatorText("Navigation");
         if (ImGui::Button("-##camera_zoom")) {
@@ -4961,9 +5599,15 @@ ViewportUiResult build_ui(
     const TileRequest& request,
     const std::size_t layer_index,
     const DisplayMode mode,
-    const SpeckleSettings& speckle) noexcept {
+    const SpeckleSettings& speckle,
+    const AnalysisMode analysis = AnalysisMode::single_layer,
+    const std::size_t compare_layer =
+        std::numeric_limits<std::size_t>::max()) noexcept {
     return request.layer_index == layer_index && request.mode == mode &&
-        request.speckle == speckle;
+        request.speckle == speckle && request.analysis == analysis &&
+        (analysis == AnalysisMode::single_layer ||
+         request.compare_layer_index == compare_layer ||
+         analysis == AnalysisMode::pauli_rgb);
 }
 
 [[nodiscard]] bool same_overview_window(
@@ -5161,6 +5805,66 @@ ViewportUiResult build_ui(
     };
 }
 
+[[nodiscard]] ResidentViewMapping composite_mapping(
+    const std::size_t layer_index,
+    const satview::composite::PageCompletion& completion) {
+    if (!completion.ready() || !completion.plan.has_value()) {
+        fail("composite mapping requires prepared data");
+    }
+    const auto& layout = completion.plan->aligned_plan.layout;
+    if (layout.output_dimensions[0] == 0 ||
+        layout.output_dimensions[1] == 0 ||
+        layout.output_dimensions[0] >
+            std::numeric_limits<std::uint32_t>::max() ||
+        layout.output_dimensions[1] >
+            std::numeric_limits<std::uint32_t>::max()) {
+        fail("prepared composite has invalid mapping dimensions");
+    }
+    return ResidentViewMapping{
+        .layer_index = layer_index,
+        .actual_scene = satview::viewer::PixelWindow{
+            layout.source_origin[0],
+            layout.source_origin[1],
+            layout.source_dimensions[0],
+            layout.source_dimensions[1]},
+        .texture_origin_row =
+            static_cast<double>(layout.source_origin[0]) + 0.5 -
+            0.5 * static_cast<double>(layout.sample_stride[0]),
+        .texture_origin_column =
+            static_cast<double>(layout.source_origin[1]) + 0.5 -
+            0.5 * static_cast<double>(layout.sample_stride[1]),
+        .sample_stride_row = layout.sample_stride[0],
+        .sample_stride_column = layout.sample_stride[1],
+        .texture_width = static_cast<std::uint32_t>(
+            layout.output_dimensions[1]),
+        .texture_height = static_cast<std::uint32_t>(
+            layout.output_dimensions[0]),
+    };
+}
+
+[[nodiscard]] satview::composite::SourceTransform composite_transform(
+    const DisplayMode mode) {
+    switch (mode) {
+        case DisplayMode::amplitude:
+            return satview::composite::SourceTransform::amplitude;
+        case DisplayMode::power:
+            return satview::composite::SourceTransform::power;
+        case DisplayMode::power_db:
+            return satview::composite::SourceTransform::power_db;
+        case DisplayMode::phase:
+            return satview::composite::SourceTransform::phase;
+        case DisplayMode::real:
+            return satview::composite::SourceTransform::real;
+        case DisplayMode::imaginary:
+            return satview::composite::SourceTransform::imaginary;
+        case DisplayMode::linear:
+            return satview::composite::SourceTransform::linear;
+        case DisplayMode::magnitude:
+            return satview::composite::SourceTransform::magnitude;
+    }
+    fail("unsupported composite source transform");
+}
+
 [[nodiscard]] std::optional<std::filesystem::path> choose_product_file(
     std::string& error) {
     std::array<wchar_t, 32'768> path{};
@@ -5193,8 +5897,19 @@ ViewportUiResult build_ui(
     const std::string_view initial_error,
     const ComputeBackend backend) {
     SdlSession sdl;
-    VulkanRenderer renderer(
-        sdl.window(), 1, 1, backend == ComputeBackend::cuda);
+    std::unique_ptr<VulkanRenderer> renderer_storage;
+    if (backend == ComputeBackend::cuda) {
+        perform_cuda_initialization(
+            "CUDA/Vulkan launcher initialization failed",
+            [&] {
+                renderer_storage = std::make_unique<VulkanRenderer>(
+                    sdl.window(), 1, 1, true);
+            });
+    } else {
+        renderer_storage = std::make_unique<VulkanRenderer>(
+            sdl.window(), 1, 1, false);
+    }
+    VulkanRenderer& renderer = *renderer_storage;
     ImGuiSession imgui(sdl.window(), renderer);
     DisplayPushConstants display;
     std::string error(initial_error);
@@ -5282,33 +5997,136 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
     satview::Hdf5Product product(arguments.file);
     const ProductView product_view = build_product_view(product);
     SdlSession sdl;
-    VulkanRenderer renderer(
-        sdl.window(),
-        product_view.maximum_mosaic_width,
-        product_view.maximum_mosaic_height,
-        backend == ComputeBackend::cuda);
-    ImGuiSession imgui(sdl.window(), renderer);
+    std::unique_ptr<VulkanRenderer> renderer_storage;
     std::unique_ptr<TilePipeline> pipeline;
     if (backend == ComputeBackend::cuda) {
 #if defined(SATVIEW_HAS_CUDA)
-        pipeline = std::make_unique<CudaTilePipeline>(
-            product_view.maximum_science_mosaic_bytes, renderer);
+        perform_cuda_initialization(
+            "CUDA/Vulkan renderer initialization failed",
+            [&] {
+                renderer_storage = std::make_unique<VulkanRenderer>(
+                    sdl.window(),
+                    product_view.maximum_mosaic_width,
+                    product_view.maximum_mosaic_height,
+                    true);
+            });
+        perform_cuda_initialization(
+            "CUDA compute pipeline initialization failed",
+            [&] {
+                pipeline = std::make_unique<CudaTilePipeline>(
+                    product_view.maximum_science_mosaic_bytes,
+                    *renderer_storage);
+            });
 #else
         fail("CUDA backend selected by a CUDA-free viewer build");
 #endif
     } else {
+        renderer_storage = std::make_unique<VulkanRenderer>(
+            sdl.window(),
+            product_view.maximum_mosaic_width,
+            product_view.maximum_mosaic_height,
+            false);
         pipeline = std::make_unique<HostTilePipeline>(
             backend,
             product_view.maximum_science_mosaic_bytes,
-            renderer);
+            *renderer_storage);
     }
     pipeline->set_layers(product_view);
-    TileReader reader(product, product_view, pipeline->page_locked_reads());
+    auto reader_storage = std::make_unique<TileReader>(
+        product, product_view, pipeline->page_locked_reads());
+    VulkanRenderer& renderer = *renderer_storage;
+    TileReader& reader = *reader_storage;
+    ImGuiSession imgui(sdl.window(), renderer);
+    PipelineDrainGuard pipeline_drain(*pipeline);
     satview::viewer::OverviewWorker overview_worker(product);
+    satview::composite::PageWorker composite_worker(product);
 
     std::size_t selected_layer = product_view.default_layer;
-    std::size_t scheduled_layer = selected_layer;
+    if (!arguments.layer_path.empty()) {
+        const auto requested = find_layer_index(
+            product_view, arguments.layer_path);
+        if (!requested.has_value()) {
+            fail("--layer does not name a renderable science dataset");
+        }
+        selected_layer = *requested;
+    }
     DisplayMode display_mode = DisplayMode::power_db;
+    AnalysisMode analysis_mode = arguments.analysis;
+    std::size_t compare_layer = selected_layer;
+    if (!arguments.compare_layer_path.empty()) {
+        const auto requested = find_layer_index(
+            product_view, arguments.compare_layer_path);
+        if (!requested.has_value()) {
+            fail("--compare-layer does not name a renderable science dataset");
+        }
+        compare_layer = *requested;
+    }
+    std::string pauli_frequency = arguments.pauli_frequency;
+    const auto pauli_capabilities =
+        satview::analysis::resolve_pauli_capabilities(product);
+    if (analysis_mode == AnalysisMode::pauli_rgb) {
+        const auto capability = std::find_if(
+            pauli_capabilities.begin(), pauli_capabilities.end(),
+            [&](const satview::analysis::PauliCapability& value) {
+                return value.frequency == pauli_frequency;
+            });
+        if (capability != pauli_capabilities.end() &&
+            capability->available && capability->recipe.has_value()) {
+            const auto primary = find_layer_index(
+                product_view, capability->recipe->hhhh_dataset_path);
+            if (!primary.has_value()) {
+                fail("Pauli HHHH source is not renderable");
+            }
+            selected_layer = *primary;
+        } else if (arguments.smoke_test) {
+            fail(
+                capability == pauli_capabilities.end()
+                ? "Pauli frequency is absent from this product"
+                : "Pauli decomposition is unavailable: " +
+                      capability->reason);
+        }
+    }
+    const auto selected_modes =
+        modes_for(*product_view.layers[selected_layer].dataset);
+    if (std::none_of(
+            selected_modes.begin(), selected_modes.end(),
+            [&](const ModeChoice& choice) {
+                return choice.mode == display_mode;
+            })) {
+        display_mode = selected_modes.front().mode;
+    }
+    if (arguments.smoke_test &&
+        analysis_mode != AnalysisMode::single_layer &&
+        analysis_mode != AnalysisMode::pauli_rgb) {
+        if (compare_layer == selected_layer ||
+            compare_layer >= product_view.layers.size()) {
+            fail("comparison smoke tests require --compare-layer");
+        }
+        const auto capability =
+            satview::analysis::resolve_compare_capability(
+                product,
+                product_view.layers[selected_layer].dataset->path,
+                product_view.layers[compare_layer].dataset->path);
+        const auto requested_mode =
+            analysis_mode == AnalysisMode::compare_split
+            ? satview::analysis::CompareMode::swipe
+            : analysis_mode == AnalysisMode::compare_swipe
+                ? satview::analysis::CompareMode::swipe
+                : analysis_mode == AnalysisMode::compare_difference
+                    ? satview::analysis::CompareMode::difference
+                    : satview::analysis::CompareMode::ratio;
+        if (!capability.supports(requested_mode) ||
+            !capability.recipe.has_value() ||
+            !capability.recipe->strictly_aligned) {
+            fail("comparison is unavailable: " +
+                 std::string(capability.reason_for(requested_mode)));
+        }
+    }
+    std::size_t scheduled_layer = selected_layer;
+    AnalysisMode scheduled_analysis = analysis_mode;
+    std::size_t scheduled_compare_layer = compare_layer;
+    DisplayMode scheduled_display_mode = display_mode;
+    std::string scheduled_pauli_frequency = pauli_frequency;
     std::uint64_t tile_row =
         (product_view.layers[selected_layer].tile_rows - 1) / 2;
     std::uint64_t tile_column =
@@ -5317,12 +6135,32 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
     ViewportNavigationState navigation;
     bool controls_visible = !arguments.clean_view;
     DisplayPushConstants display;
+    display.compare_position = arguments.compare_divider;
     SpeckleSettings speckle_settings{
         .filter = arguments.speckle_filter,
         .window_size = arguments.speckle_window,
         .equivalent_number_of_looks = arguments.speckle_looks,
     };
     reset_display_for_mode(display_mode, display);
+    if (analysis_mode == AnalysisMode::pauli_rgb) {
+        display_mode = DisplayMode::power_db;
+        display.low = -35.0F;
+        display.high = 5.0F;
+        display.gamma = 1.0F;
+        display.circular_phase = 0;
+    } else if (analysis_mode == AnalysisMode::compare_difference ||
+               analysis_mode == AnalysisMode::compare_ratio) {
+        if (analysis_mode == AnalysisMode::compare_ratio) {
+            display_mode = DisplayMode::power_db;
+            display.circular_phase = 0;
+        }
+        display.low = -10.0F;
+        display.high = 10.0F;
+        display.gamma = 1.0F;
+        display.colormap = static_cast<std::uint32_t>(
+            satview::viewer::ColormapId::cmweather_balance);
+    }
+    scheduled_display_mode = display_mode;
 
     bool done = false;
     bool request_tile = true;
@@ -5333,6 +6171,7 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
     std::uint64_t camera_generation = 0;
     std::uint64_t latest_native_serial = 0;
     std::uint64_t overview_serial = 0;
+    std::uint64_t composite_serial = 0;
     std::uint64_t last_vulkan_consumed = 0;
     std::optional<TileRequest> queued_request;
     std::optional<TileRequest> active_native_request;
@@ -5350,6 +6189,10 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
 
     std::optional<ReadCompletion> deferred_completion;
     std::optional<satview::viewer::OverviewWorkerCompletion> prepared_overview;
+    std::optional<satview::composite::PageCompletion> prepared_composite;
+    std::optional<satview::composite::PageRequest> composite_job_request;
+    std::optional<std::uint64_t> composite_job_serial;
+    std::optional<std::uint64_t> composite_job_camera_generation;
     std::optional<std::uint64_t> overview_job_serial;
     std::optional<std::size_t> overview_job_layer;
     std::optional<satview::overview::OverviewRequest> overview_job_request;
@@ -5450,6 +6293,7 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
                 overview_job_layer.reset();
                 overview_job_request.reset();
                 overview_prepare_ms = completion->elapsed_milliseconds;
+                hdf5_ms = completion->elapsed_milliseconds;
                 if (!completion->error.empty()) {
                     overview_failed = true;
                     failed_overview_layer = completion->layer_index;
@@ -5497,6 +6341,47 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
                             "memory only",
                             overview_density);
                     }
+                }
+            }
+        }
+
+        if (auto completion = composite_worker.try_take_completion()) {
+            const bool expected = composite_job_serial.has_value() &&
+                completion->serial == *composite_job_serial &&
+                composite_job_request.has_value();
+            if (expected) {
+                const auto completion_camera_generation =
+                    composite_job_camera_generation.value_or(0);
+                composite_job_serial.reset();
+                composite_job_request.reset();
+                composite_job_camera_generation.reset();
+                overview_prepare_ms = completion->elapsed_milliseconds;
+                hdf5_ms = completion->elapsed_milliseconds;
+                if (!completion->error.empty()) {
+                    status = "Composite analysis failed: " + completion->error;
+                    prepared_composite.reset();
+                } else if (completion->ready()) {
+                    prepared_composite = std::move(*completion);
+                    TileRequest candidate;
+                    candidate.serial = ++tile_serial;
+                    candidate.camera_generation =
+                        completion_camera_generation;
+                    candidate.layer_index = selected_layer;
+                    candidate.compare_layer_index = compare_layer;
+                    candidate.mode = display_mode;
+                    candidate.analysis = analysis_mode;
+                    candidate.source_kind = TileSourceKind::derived_composite;
+                    candidate.composite_identity =
+                        prepared_composite->serial;
+                    candidate.display_encoding =
+                        analysis_mode == AnalysisMode::pauli_rgb
+                        ? DisplayEncoding::pauli_rgb10
+                        : (analysis_mode == AnalysisMode::compare_split ||
+                           analysis_mode == AnalysisMode::compare_swipe)
+                            ? DisplayEncoding::compare_bfloat_pair
+                            : DisplayEncoding::scalar;
+                    queued_request = candidate;
+                    status = "Composite analysis page ready; publication pending";
                 }
             }
         }
@@ -5568,7 +6453,35 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
             !pending_upload.has_value() && !pipeline->timing_pending() &&
             !outgoing_slot.has_value()) {
             const TileRequest request = *queued_request;
-            if (request.source_kind == TileSourceKind::raw_overview) {
+            if (request.source_kind == TileSourceKind::derived_composite) {
+                if (!prepared_composite.has_value() ||
+                    !prepared_composite->ready() ||
+                    prepared_composite->serial != request.composite_identity ||
+                    !prepared_composite->plan.has_value()) {
+                    queued_request.reset();
+                    request_deadline = Clock::now();
+                } else {
+                    pending_mapping = composite_mapping(
+                        request.layer_index, *prepared_composite);
+                    const auto& layout =
+                        prepared_composite->plan->aligned_plan.layout;
+                    const bool build_distribution =
+                        request.display_encoding == DisplayEncoding::scalar;
+                    pending_upload = pipeline->upload_precomputed(
+                        request,
+                        prepared_composite->values,
+                        static_cast<std::uint32_t>(
+                            layout.output_dimensions[1]),
+                        static_cast<std::uint32_t>(
+                            layout.output_dimensions[0]),
+                        build_distribution,
+                        last_vulkan_consumed);
+                    image_width = pending_upload->width;
+                    image_height = pending_upload->height;
+                    queued_request.reset();
+                    status = "Composite analysis publication queued";
+                }
+            } else if (request.source_kind == TileSourceKind::raw_overview) {
                 if (!prepared_overview.has_value() ||
                     !prepared_overview->ready() ||
                     prepared_overview->request_serial !=
@@ -5689,8 +6602,8 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
                    pending_mapping.has_value() &&
                    pending_upload->request.layer_index == selected_layer &&
                    pending_upload->request.mode == display_mode) {
-            // Keep a valid old resident on screen while the inactive slot is
-            // uploaded. First publication still uses the pending mapping.
+            // With no compatible publication, frame the upload using its
+            // mapping so its first submitted frame is positioned correctly.
             frame_mapping = pending_mapping;
             frame_request = &pending_upload->request;
         }
@@ -5718,6 +6631,10 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
             renderer,
             selected_layer,
             display_mode,
+            analysis_mode,
+            compare_layer,
+            pauli_frequency,
+            pauli_capabilities,
             speckle_settings,
             tile_row,
             tile_column,
@@ -5737,9 +6654,11 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
             reader.ring_state());
 
         const SpeckleSettings effective_speckle =
-            effective_speckle_settings(
-                *product_view.layers[selected_layer].dataset,
-                display_mode, speckle_settings);
+            analysis_mode == AnalysisMode::single_layer
+            ? effective_speckle_settings(
+                  *product_view.layers[selected_layer].dataset,
+                  display_mode, speckle_settings)
+            : SpeckleSettings{};
         const auto framebuffer_scale = ImGui::GetIO().DisplayFramebufferScale;
         framebuffer_scale_x =
             std::isfinite(framebuffer_scale.x) && framebuffer_scale.x > 0.0F
@@ -5790,14 +6709,14 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
             published_mapping.has_value() &&
             request_matches_controls(
                 *published_request, selected_layer, display_mode,
-                effective_speckle) &&
+                effective_speckle, analysis_mode, compare_layer) &&
             resident_contains(*published_mapping, desired_visible);
         const bool outgoing_covers_reversed_view =
             outgoing_request.has_value() && outgoing_mapping.has_value() &&
             outgoing_slot.has_value() &&
             request_matches_controls(
                 *outgoing_request, selected_layer, display_mode,
-                effective_speckle) &&
+                effective_speckle, analysis_mode, compare_layer) &&
             resident_contains(*outgoing_mapping, desired_visible);
         if (!published_covers_reversed_view &&
             outgoing_covers_reversed_view) {
@@ -5819,13 +6738,13 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
             const bool pending_matches_controls =
                 request_matches_controls(
                     pending_upload->request, selected_layer, display_mode,
-                    effective_speckle);
+                    effective_speckle, analysis_mode, compare_layer);
             const bool published_covers_current =
                 published_image_valid && published_request.has_value() &&
                 published_mapping.has_value() &&
                 request_matches_controls(
                     *published_request, selected_layer, display_mode,
-                    effective_speckle) &&
+                    effective_speckle, analysis_mode, compare_layer) &&
                 resident_contains(*published_mapping, desired_visible);
             const bool pending_covers_current =
                 resident_contains(*pending_mapping, desired_visible);
@@ -5848,8 +6767,57 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
         }
 
         const auto now = Clock::now();
-        if (selected_layer != scheduled_layer) {
+        const auto pair_layout = [](const AnalysisMode value) noexcept {
+            return value == AnalysisMode::compare_split ||
+                value == AnalysisMode::compare_swipe;
+        };
+        const bool pair_layout_only_change =
+            selected_layer == scheduled_layer &&
+            compare_layer == scheduled_compare_layer &&
+            display_mode == scheduled_display_mode &&
+            pauli_frequency == scheduled_pauli_frequency &&
+            analysis_mode != scheduled_analysis &&
+            pair_layout(analysis_mode) && pair_layout(scheduled_analysis);
+        const bool composite_control_changed =
+            analysis_mode != scheduled_analysis ||
+            ((analysis_mode != AnalysisMode::single_layer ||
+              scheduled_analysis != AnalysisMode::single_layer) &&
+             display_mode != scheduled_display_mode) ||
+            (analysis_mode != AnalysisMode::single_layer &&
+             compare_layer != scheduled_compare_layer) ||
+            (analysis_mode == AnalysisMode::pauli_rgb &&
+             pauli_frequency != scheduled_pauli_frequency);
+        if (pair_layout_only_change) {
+            scheduled_analysis = analysis_mode;
+            const auto update_layout = [&](auto& request) {
+                if (request.has_value() &&
+                    request->source_kind ==
+                        TileSourceKind::derived_composite &&
+                    request->display_encoding ==
+                        DisplayEncoding::compare_bfloat_pair) {
+                    request->analysis = analysis_mode;
+                }
+            };
+            update_layout(queued_request);
+            update_layout(published_request);
+            update_layout(outgoing_request);
+            if (pending_upload.has_value() &&
+                pending_upload->request.source_kind ==
+                    TileSourceKind::derived_composite &&
+                pending_upload->request.display_encoding ==
+                    DisplayEncoding::compare_bfloat_pair) {
+                pending_upload->request.analysis = analysis_mode;
+            }
+            status = analysis_mode == AnalysisMode::compare_split
+                ? "Reusing aligned pair for split comparison"
+                : "Reusing aligned pair for swipe comparison";
+        } else if (selected_layer != scheduled_layer ||
+            composite_control_changed) {
             scheduled_layer = selected_layer;
+            scheduled_analysis = analysis_mode;
+            scheduled_compare_layer = compare_layer;
+            scheduled_display_mode = display_mode;
+            scheduled_pauli_frequency = pauli_frequency;
             cancel_native();
             queued_request.reset();
             outgoing_request.reset();
@@ -5867,6 +6835,12 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
             failed_overview_layer.reset();
             failed_overview_request.reset();
             overview_error.clear();
+            ++composite_serial;
+            composite_worker.supersede(composite_serial);
+            composite_job_serial.reset();
+            composite_job_request.reset();
+            composite_job_camera_generation.reset();
+            prepared_composite.reset();
             overview_density = 0.0;
             hdf5_ms = 0.0;
             request_deadline = now;
@@ -5901,6 +6875,211 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
                 .chunk_height = layer.tile_height,
                 .chunk_width = layer.tile_width,
             };
+
+            if (analysis_mode != AnalysisMode::single_layer) {
+                const auto raster = navigation_raster(layer);
+                const satview::viewer::GuardedOverviewOptions options{
+                    .maximum_level = 63,
+                    .page_extent = 512,
+                    .maximum_resident_extent = 4096,
+                    .target_texels_per_logical_pixel =
+                        1.25 * std::max(
+                            framebuffer_scale_x, framebuffer_scale_y),
+                    .guard_fraction = 0.25,
+                };
+                const auto lod = satview::viewer::make_guarded_overview_request(
+                    navigation.camera, raster, ui.canvas, options);
+                satview::Window2D source_window{
+                    .row = lod.resident_source_window.row,
+                    .column = lod.resident_source_window.column,
+                    .height = lod.resident_source_window.height,
+                    .width = lod.resident_source_window.width,
+                };
+                std::array<std::uint64_t, 2> stride{
+                    lod.visible.sample_stride,
+                    lod.visible.sample_stride};
+                if (force_native_footprint) {
+                    const auto footprint =
+                        satview::viewer::make_mosaic_geometry(
+                            tile_row, tile_column, layer.tile_rows,
+                            layer.tile_columns, layer.tile_height,
+                            layer.tile_width, layer.dataset->dimensions[0],
+                            layer.dataset->dimensions[1], mosaic_span);
+                    source_window = satview::Window2D{
+                        .row = footprint.pixel_row,
+                        .column = footprint.pixel_column,
+                        .height = footprint.pixel_height,
+                        .width = footprint.pixel_width,
+                    };
+                    stride = {1, 1};
+                }
+
+                satview::composite::PageRequest composite_request;
+                composite_request.camera_generation = camera_generation;
+                composite_request.source_window = source_window;
+                composite_request.sample_stride = stride;
+                // The aligned reader accounts the theoretical materialized
+                // sources, although the composite builder streams them. Keep
+                // that conservative budget bounded at 512 MiB.
+                composite_request.maximum_output_bytes =
+                    512ULL * 1024ULL * 1024ULL;
+                composite_request.maximum_scratch_bytes =
+                    64ULL * 1024ULL * 1024ULL;
+                composite_request.prefer_direct_chunk_decode =
+                    stride[0] > 1 || stride[1] > 1;
+
+                std::string capability_error;
+                if (analysis_mode == AnalysisMode::pauli_rgb) {
+                    const auto capability = std::find_if(
+                        pauli_capabilities.begin(),
+                        pauli_capabilities.end(),
+                        [&](const satview::analysis::PauliCapability& value) {
+                            return value.frequency == pauli_frequency;
+                        });
+                    if (capability == pauli_capabilities.end() ||
+                        !capability->available ||
+                        !capability->recipe.has_value()) {
+                        capability_error =
+                            capability == pauli_capabilities.end()
+                            ? "selected frequency is absent"
+                            : capability->reason;
+                    } else {
+                        composite_request.kind =
+                            satview::composite::PageKind::pauli_rgb;
+                        composite_request.pauli = *capability->recipe;
+                    }
+                } else if (compare_layer >= product_view.layers.size() ||
+                           compare_layer == selected_layer) {
+                    capability_error =
+                        "choose a different compatible comparison layer";
+                } else {
+                    const auto capability =
+                        satview::analysis::resolve_compare_capability(
+                            product,
+                            layer.dataset->path,
+                            product_view.layers[compare_layer].dataset->path);
+                    const auto requested_mode =
+                        analysis_mode == AnalysisMode::compare_split
+                        ? satview::analysis::CompareMode::swipe
+                        : analysis_mode == AnalysisMode::compare_swipe
+                            ? satview::analysis::CompareMode::swipe
+                            : analysis_mode ==
+                                      AnalysisMode::compare_difference
+                                ? satview::analysis::CompareMode::difference
+                                : satview::analysis::CompareMode::ratio;
+                    if (!capability.supports(requested_mode) ||
+                        !capability.recipe.has_value() ||
+                        !capability.recipe->strictly_aligned) {
+                        capability_error = std::string(
+                            capability.reason_for(requested_mode));
+                    } else {
+                        composite_request.compare = *capability.recipe;
+                        composite_request.transform =
+                            composite_transform(display_mode);
+                        composite_request.kind =
+                            analysis_mode == AnalysisMode::compare_split ||
+                                analysis_mode == AnalysisMode::compare_swipe
+                            ? satview::composite::PageKind::compare_pair
+                            : analysis_mode ==
+                                      AnalysisMode::compare_difference
+                                ? satview::composite::PageKind::compare_difference
+                                : satview::composite::PageKind::compare_ratio_db;
+                    }
+                }
+
+                cancel_native();
+                ++overview_serial;
+                overview_worker.supersede(overview_serial);
+                overview_job_serial.reset();
+                overview_job_layer.reset();
+                overview_job_request.reset();
+                prepared_overview.reset();
+                queued_request.reset();
+                if (!capability_error.empty()) {
+                    status = "Composite analysis unavailable: " +
+                        capability_error;
+                } else {
+                    const auto active_matches =
+                        composite_job_request.has_value() &&
+                        satview::composite::same_page_source(
+                            *composite_job_request, composite_request);
+                    const auto prepared_matches =
+                        prepared_composite.has_value() &&
+                        prepared_composite->ready() &&
+                        prepared_composite->plan.has_value() &&
+                        satview::composite::same_page_source(
+                            prepared_composite->plan->request,
+                            composite_request);
+                    const auto encoding =
+                        analysis_mode == AnalysisMode::pauli_rgb
+                        ? DisplayEncoding::pauli_rgb10
+                        : (analysis_mode == AnalysisMode::compare_split ||
+                           analysis_mode == AnalysisMode::compare_swipe)
+                            ? DisplayEncoding::compare_bfloat_pair
+                            : DisplayEncoding::scalar;
+                    const auto make_candidate = [&] {
+                        TileRequest candidate;
+                        candidate.serial = ++tile_serial;
+                        candidate.camera_generation = camera_generation;
+                        candidate.layer_index = selected_layer;
+                        candidate.compare_layer_index = compare_layer;
+                        candidate.mode = display_mode;
+                        candidate.analysis = analysis_mode;
+                        candidate.source_kind =
+                            TileSourceKind::derived_composite;
+                        candidate.composite_identity =
+                            prepared_composite->serial;
+                        candidate.display_encoding = encoding;
+                        return candidate;
+                    };
+                    const bool published_matches = prepared_matches &&
+                        published_request.has_value() &&
+                        published_mapping.has_value() &&
+                        published_request->source_kind ==
+                            TileSourceKind::derived_composite &&
+                        published_request->composite_identity ==
+                        prepared_composite->serial &&
+                        resident_contains(*published_mapping, desired_visible);
+                    const bool pending_matches = prepared_matches &&
+                        pending_upload.has_value() &&
+                        pending_upload->request.source_kind ==
+                            TileSourceKind::derived_composite &&
+                        pending_upload->request.composite_identity ==
+                            prepared_composite->serial;
+                    if (active_matches) {
+                        status = "Composite request already in progress";
+                    } else if (pending_matches) {
+                        pending_upload->request.analysis = analysis_mode;
+                        pending_upload->request.mode = display_mode;
+                        pending_upload->request.compare_layer_index =
+                            compare_layer;
+                        pending_upload->request.display_encoding = encoding;
+                        status = "Composite page already awaiting publication";
+                    } else if (published_matches) {
+                        published_request->analysis = analysis_mode;
+                        published_request->mode = display_mode;
+                        published_request->compare_layer_index = compare_layer;
+                        published_request->display_encoding = encoding;
+                        status = "Reusing resident composite page";
+                    } else if (prepared_matches) {
+                        queued_request = make_candidate();
+                        status = "Reusing prepared composite page";
+                    } else {
+                    composite_serial += 2;
+                    composite_worker.supersede(composite_serial - 1);
+                    composite_request.serial = composite_serial;
+                    composite_job_serial = composite_serial;
+                    composite_job_request = composite_request;
+                    composite_job_camera_generation = camera_generation;
+                    prepared_composite.reset();
+                    composite_worker.request(std::move(composite_request));
+                    status = analysis_mode == AnalysisMode::pauli_rgb
+                        ? "Streaming aligned covariance terms for Pauli RGB"
+                        : "Streaming aligned layers for comparison";
+                    }
+                }
+                request_deadline.reset();
+            } else {
 
             std::optional<satview::viewer::MosaicGeometry>
                 forced_native;
@@ -6121,9 +7300,9 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
                     active_native_request.has_value() &&
                     same_tile_source(*active_native_request, candidate);
                 if (active_source_matches) {
-                    // Mode/filter settings are CUDA choices, not HDF5 source
-                    // identity. Keep the reader serial authoritative until its
-                    // source is resident, then apply the latest settings in-order.
+                    // Mode/filter settings are compute-stage choices, not HDF5
+                    // source identity. Keep the reader serial authoritative until
+                    // its source is resident, then apply the latest settings in-order.
                     candidate.serial = active_native_request->serial;
                     const bool correction_is_queued =
                         queued_request.has_value() &&
@@ -6237,6 +7416,7 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
                 }
             }
             request_deadline.reset();
+            }
         }
 
         std::optional<std::uint32_t> upload_destination_slot;
@@ -6254,18 +7434,21 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
         const bool published_draw_compatible =
             published_image_valid && published_request.has_value() &&
             published_mapping.has_value() && published_slot.has_value() &&
-            published_request->layer_index == selected_layer &&
-            published_request->mode == display_mode;
+            request_matches_controls(
+                *published_request, selected_layer, display_mode,
+                effective_speckle, analysis_mode, compare_layer);
         const bool pending_draw_compatible =
             pending_upload.has_value() && pending_mapping.has_value() &&
             upload_destination_slot.has_value() &&
-            pending_upload->request.layer_index == selected_layer &&
-            pending_upload->request.mode == display_mode;
+            request_matches_controls(
+                pending_upload->request, selected_layer, display_mode,
+                effective_speckle, analysis_mode, compare_layer);
         const bool outgoing_draw_compatible =
             outgoing_request.has_value() && outgoing_mapping.has_value() &&
             outgoing_slot.has_value() &&
-            outgoing_request->layer_index == selected_layer &&
-            outgoing_request->mode == display_mode;
+            request_matches_controls(
+                *outgoing_request, selected_layer, display_mode,
+                effective_speckle, analysis_mode, compare_layer);
 
         std::optional<ResidentDrawView> published_draw;
         std::optional<ResidentDrawView> pending_draw;
@@ -6335,6 +7518,17 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
         display.samples = {};
         display.sample_weights = {0.0F, 0.0F};
         display.active_slots = 0;
+        display.display_encoding = static_cast<std::uint32_t>(
+            draw_valid ? draw_source->display_encoding
+                       : DisplayEncoding::scalar);
+        display.compare_layout = 0;
+        if (draw_valid &&
+            draw_source->analysis == AnalysisMode::compare_split) {
+            display.compare_layout = 1;
+        } else if (draw_valid &&
+                   draw_source->analysis == AnalysisMode::compare_swipe) {
+            display.compare_layout = 2;
+        }
         ui.resident_visible = draw_valid;
         if (draw_valid) {
             ui.scientific_window = primary_draw->window;
@@ -6353,7 +7547,9 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
         const auto transition_compatible = [](
             const TileRequest& left, const TileRequest& right) {
             return left.layer_index == right.layer_index &&
-                left.mode == right.mode;
+                left.compare_layer_index == right.compare_layer_index &&
+                left.mode == right.mode && left.analysis == right.analysis &&
+                left.display_encoding == right.display_encoding;
         };
 
         if (draw_valid && primary_is_published &&
@@ -6415,7 +7611,7 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
             upload_destination_slot);
         const bool smoke_frame_valid = draw_valid &&
             (!arguments.fit_scene ||
-             draw_source->source_kind == TileSourceKind::raw_overview);
+             draw_source->source_kind != TileSourceKind::native_mosaic);
         if (frame.upload_submitted) {
             if (!pending_upload.has_value() ||
                 !pending_mapping.has_value() ||
@@ -6453,7 +7649,7 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
             pending_mapping.reset();
             status = request_matches_controls(
                     *published_request, selected_layer, display_mode,
-                    effective_speckle)
+                    effective_speckle, analysis_mode, compare_layer)
                 ? ""
                 : "Obsolete GPU publication completed; scheduling current view";
         }
@@ -6479,7 +7675,9 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
     }
 
     overview_worker.set_foreground_active(false);
+    composite_worker.stop();
     overview_worker.stop();
+    pipeline->drain();
     reader.stop();
     if (arguments.smoke_test) {
         if (!published_request.has_value() ||
@@ -6489,7 +7687,40 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
         std::cout << "sat-viewer smoke test passed: "
                   << image_width << 'x' << image_height << ' ';
         if (published_request->source_kind ==
-            TileSourceKind::raw_overview) {
+            TileSourceKind::derived_composite) {
+            const auto& mapping = *published_mapping;
+            std::cout << "composite ";
+            switch (published_request->analysis) {
+                case AnalysisMode::pauli_rgb:
+                    std::cout << "Pauli RGB";
+                    break;
+                case AnalysisMode::compare_split:
+                    std::cout << "layer split";
+                    break;
+                case AnalysisMode::compare_swipe:
+                    std::cout << "layer swipe";
+                    break;
+                case AnalysisMode::compare_difference:
+                    std::cout << "difference A-B";
+                    break;
+                case AnalysisMode::compare_ratio:
+                    std::cout << "power ratio dB";
+                    break;
+                case AnalysisMode::single_layer:
+                    std::cout << "unknown";
+                    break;
+            }
+            std::cout << ", origin " << mapping.actual_scene.row << ','
+                      << mapping.actual_scene.column << ", coverage "
+                      << mapping.actual_scene.height << 'x'
+                      << mapping.actual_scene.width << ", stride "
+                      << mapping.sample_stride_row << 'x'
+                      << mapping.sample_stride_column << ", output "
+                      << mapping.texture_height << 'x'
+                      << mapping.texture_width << ", aligned HDF5+compose "
+                      << hdf5_ms << " ms, memory only, ";
+        } else if (published_request->source_kind ==
+                   TileSourceKind::raw_overview) {
             const auto& mapping = *published_mapping;
             const auto raster = navigation_raster(
                 product_view.layers.at(published_request->layer_index));
@@ -6533,21 +7764,58 @@ int run(const Arguments& arguments, const ComputeBackend backend) {
 int main(int argc, char** argv) {
     try {
         Arguments arguments = parse_arguments(argc, argv);
-        const ComputeBackend backend = select_backend(arguments.backend);
+        ComputeBackend backend = select_backend(arguments.backend);
+        const auto fallback_to_cpu = [&] {
+            if (arguments.backend != BackendPreference::automatic ||
+                backend != ComputeBackend::cuda) {
+                return false;
+            }
+            backend = ComputeBackend::cpu;
+            return true;
+        };
         if (!arguments.file.empty()) {
-            return run(arguments, backend);
+            try {
+                return run(arguments, backend);
+            } catch (const CudaInitializationError& error) {
+                if (!fallback_to_cpu()) {
+                    throw;
+                }
+                std::cerr << "sat-viewer: " << error.what()
+                          << "; retrying initialization with CPU\n";
+                return run(arguments, backend);
+            }
         }
 
         std::string open_error;
         while (true) {
-            const auto selected = run_file_launcher(
-                arguments.frame_limit, open_error, backend);
+            std::optional<std::filesystem::path> selected;
+            try {
+                selected = run_file_launcher(
+                    arguments.frame_limit, open_error, backend);
+            } catch (const CudaInitializationError& error) {
+                if (!fallback_to_cpu()) {
+                    throw;
+                }
+                open_error = std::string(error.what()) +
+                    "; using CPU instead";
+                continue;
+            }
             if (!selected.has_value()) {
                 return 0;
             }
             arguments.file = *selected;
             try {
                 return run(arguments, backend);
+            } catch (const CudaInitializationError&) {
+                if (!fallback_to_cpu()) {
+                    throw;
+                }
+                try {
+                    return run(arguments, backend);
+                } catch (const std::exception& retry_error) {
+                    open_error = retry_error.what();
+                    arguments.file.clear();
+                }
             } catch (const std::exception& error) {
                 open_error = error.what();
                 arguments.file.clear();
@@ -6558,5 +7826,3 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
-
-

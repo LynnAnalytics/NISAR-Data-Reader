@@ -10,7 +10,6 @@
 
 namespace satview::gpu {
 
-// The externally visible lifetime state of a staging slot.
 enum class SlotState : std::uint8_t {
   Free,
   Filling,
