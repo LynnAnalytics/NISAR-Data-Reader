@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 4.2)
 
 project(
   NISARDataReader
-  VERSION 0.6.0
+  VERSION 0.7.0
   DESCRIPTION "CUDA-first native NISAR GSLC/GCOV viewer with CPU fallback"
   LANGUAGES CXX
 )

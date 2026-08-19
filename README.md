@@ -4,7 +4,7 @@ An open-source exploratory visualizer for (NASA-ISRO Synthetic Aperture Radar) N
 
 ![NISAR Data Reader displaying a GCOV product](docs/images/nisar-data-reader.png)
 
-[Download NISAR Data Reader v0.6.0 for Windows](https://github.com/LynnAnalytics/NISAR-Data-Reader/releases/tag/v0.6.0)
+[Download NISAR Data Reader v0.7.0 for Windows](https://github.com/LynnAnalytics/NISAR-Data-Reader/releases/tag/v0.7.0)
 
 ## Highlights
 
